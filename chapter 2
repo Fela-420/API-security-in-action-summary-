@@ -1,0 +1,275 @@
+Chapter 2 – Secure API Development (Practical Summary for Bug Bounty)
+You want to know APIs inside out for bug hunting. This chapter is about building a vulnerable API, then fixing it. That’s gold for you – because you’ll see exactly where real bugs come from.
+
+I’ll give you everything important from the chapter, but organized for actionable knowledge – no fluff, no missing pieces.
+
+1. The Example API (Natter) – What You Need to Know
+What it does: Social network with “spaces” (invite‑only groups). Users can create spaces, post messages, read messages.
+
+Two endpoints: /spaces (user API) and a moderator API (delete messages).
+
+Tech stack: Java 11, Spark framework, H2 in‑memory DB, JSON over HTTP.
+
+Why this matters for you: The vulnerabilities shown are real and common – SQLi, XSS, input validation flaws, info leaks.
+
+🎯 Takeaway: Even a simple CRUD API has multiple attack surfaces. Always map out endpoints, parameters, and how data flows.
+
+2. Injection Attacks – Your #1 Priority
+SQL Injection (SQLi) – The Classic
+Vulnerable code (string concatenation):
+
+java
+database.updateUnique(
+    "INSERT INTO spaces(space_id, name, owner) VALUES(" + spaceId + ", '" + spaceName + "', '" + owner + "');"
+);
+Attack:
+owner = "'); DROP TABLE spaces; --"
+
+Result: Database sees two statements – INSERT then DROP TABLE. The whole spaces table is deleted.
+
+Why it works: The API mixes user input into the SQL command. The database cannot tell code from data.
+
+How to detect in bug bounty:
+
+Try single quote ' in any parameter that ends up in a DB query. If you get a 500 error or a database syntax error, suspect SQLi.
+
+Try ' OR '1'='1 in login or search parameters.
+
+Use time‑based payloads if error messages are hidden: ' OR SLEEP(5) --
+
+Fix: Prepared statements (parameterised queries).
+
+java
+database.updateUnique(
+    "INSERT INTO spaces(space_id, name, owner) VALUES(?, ?, ?)", 
+    spaceId, spaceName, owner
+);
+Now user input is data, never code.
+
+🎯 For bug bounty: If you see SQL errors in API responses, that’s already an info leak. If you can inject ' OR 1=1 -- and get all records, that’s critical SQLi.
+
+Other Injection Types (Same Principle)
+LDAP injection – search filters
+
+OS command injection – if the API calls system commands
+
+Log injection – if user input goes into log files (attacker can fake log entries)
+
+Header injection – \r\n in user input can inject new HTTP headers
+
+Detection: Anywhere user input is used to build a command/query string, test for injection.
+
+3. Input Validation – Where Bugs Hide
+Common Assumptions Attackers Break
+Assumption	Attack
+Input length ≤ DB column size	Send longer value → database error (information leak)
+Username has no quotes	Single quote → SQLi
+Input is always valid JSON	Send malformed JSON → parser error (stack trace leak)
+Number is positive	Send negative number → unexpected behaviour
+Example from chapter:
+Owner username limited to 30 chars in DB. Sending 31 chars caused 500 error with full exception.
+→ Info leak: stack traces, library versions, DB type.
+
+Fix: Validate before using the input. Use allow lists (what’s allowed) not block lists (what’s forbidden).
+
+java
+if (!owner.matches("[a-zA-Z][a-zA-Z0-9]{1,29}")) {
+    throw new IllegalArgumentException("invalid username");
+}
+🎯 Bug bounty checklist:
+
+Try very long strings (overflows, truncation, DB errors)
+
+Try negative numbers, zero, decimals where int expected
+
+Try unexpected data types (string instead of array, etc.)
+
+Try Unicode / emojis (can bypass regex)
+
+Try null, true, false in JSON fields expecting strings
+
+4. Buffer Overflow & Memory Safety
+Key point: Java is memory‑safe → buffer overflows are unlikely (but not impossible in native libraries).
+But memory exhaustion is possible:
+
+java
+int msgLen = buf.getInt();   // attacker controls this
+byte[] msg = new byte[msgLen];  // allocate huge array
+Attacker sends msgLen = 2_000_000_000 (2GB). Your server runs out of memory → DoS.
+
+🎯 Test: If the API allocates based on user input (size, length, count), try extreme values.
+
+5. Cross‑Site Scripting (XSS) in APIs – Yes, Even JSON APIs
+How an API can be an XSS vector
+The Natter API returned an error with the user’s input inside a JSON object, but:
+
+Content-Type: text/html (instead of application/json)
+
+No X-Content-Type-Options: nosniff
+
+Attack:
+Attacker tricks a victim into submitting a form with:
+
+html
+<input name='{"x":"' value='","owner":"<script>alert(1)</script>"}'>
+The API sees valid JSON, rejects the owner as invalid, and echoes:
+
+json
+{"error": "invalid username: <script>alert(1)</script>"}
+Browser sees text/html → executes the script.
+
+Reflected XSS vs Persistent XSS
+Reflected XSS – input is echoed back immediately (like error messages). Requires victim to click a malicious link.
+
+Persistent XSS – input is stored in DB, then served to other users. More dangerous.
+
+🎯 For bug bounty:
+
+If an API returns user input in any response (error, success, search results), test for XSS.
+
+Even if Content-Type is application/json, check if it’s actually rendered as HTML in a web client (e.g., Angular, React might still interpret HTML).
+
+Test with <img src=x onerror=alert(1)>, <script>alert(1)</script>, javascript:alert(1).
+
+How to Fix (and What to Look For as a Tester)
+Defense	What to check in bug bounty
+Correct Content-Type: application/json	Is it missing? Is it text/html?
+X-Content-Type-Options: nosniff	Prevents browser from guessing content type. Missing? → possible XSS
+Not echoing user input back in errors	Does the API reflect my payload?
+Proper JSON encoding (not string concatenation)	Look for raw concatenation of strings into JSON.
+Content-Security-Policy: default-src 'none'	Missing CSP → more impact.
+6. Security Headers – Your Quick Audit Checklist
+Every API response (including errors) should have these headers. If missing, report as security misconfiguration (OWASP API7).
+
+Header	Recommended value	Why
+Content-Type	application/json; charset=utf-8	Prevents misinterpretation
+X-Content-Type-Options	nosniff	Stops MIME sniffing
+X-Frame-Options	DENY	Prevents clickjacking
+X-XSS-Protection	0 (yes, zero)	Disables broken browser XSS filters
+Cache-Control	no-store	Prevents sensitive caching
+Content-Security-Policy	default-src 'none'; frame-ancestors 'none'; sandbox	Hardens against XSS
+Server	"" (empty)	Removes version info
+🎯 Bug bounty tip: Many APIs leak server version (Server: Jetty(9.4.8)). That’s low severity but helps you find known CVEs for that version.
+
+7. Principle of Least Authority (POLA)
+What it means: The API’s database user should have only the permissions it needs – not DROP TABLE, not ALTER, maybe only SELECT, INSERT, UPDATE, DELETE on specific tables.
+
+Why it matters for you:
+
+If you find SQLi but the DB user is restricted (e.g., no UNION across tables, no file read), the impact is lower.
+
+If the DB user is root or sa, SQLi can lead to full compromise.
+
+How to test:
+
+After confirming SQLi, try UNION SELECT version() – if you get DB version, you can read system tables.
+
+Try INTO OUTFILE (MySQL) or xp_cmdshell (MSSQL).
+
+Try COPY (PostgreSQL).
+
+8. Exception Handling & Information Leakage
+Bad practice (what the chapter fixed):
+
+java
+catch (Exception e) {
+    return "{"error": " + e.toString() + "}";
+}
+This leaks class names, stack traces, library versions.
+
+What to look for:
+
+API returns full stack trace in response.
+
+API returns database error messages (e.g., “Column ‘xyz’ not found”).
+
+API returns “internal server error” but with different messages for different failures – that’s enumeration.
+
+Example:
+
+Wrong username → “user not found”
+
+Wrong password → “password incorrect”
+This lets you enumerate valid usernames.
+
+🎯 Report: Information disclosure via verbose error messages (medium severity usually, but can lead to more).
+
+9. Prepared Statements vs. String Concatenation – How to Spot in Black‑Box Testing
+You can’t see the source code. But you can test:
+
+String concatenation – certain characters break the query: ', ", \, %, _, ;
+
+Prepared statements – special characters are treated as data, no syntax error. But you might still have injection if the query uses dynamic table/column names (prepared statements don’t help there).
+
+Test payloads:
+
+text
+' OR '1'='1
+1; DROP TABLE users
+admin'--
+admin'--
+admin' OR '1'='1' --
+If any of these cause a different response (error, no results, or all results), test further.
+
+10. Summary Table – Vulnerabilities from Chapter 2
+Vulnerability	How to spot	Impact	Severity (typical)
+SQL Injection	Single quote causes error; ' OR '1'='1 returns extra data	DB read/write, possible RCE	Critical
+Reflected XSS	Input echoed in response, wrong Content-Type	Session theft, account takeover	High
+Info Leak (stack trace)	Exception class names in response	Reconnaissance	Low–Medium
+Missing security headers	No nosniff, no CSP	XSS, clickjacking	Low–Medium
+No input validation	Long strings cause DB error; negative numbers cause weird behaviour	DoS, bypass logic	Medium
+Buffer overflow (memory)	Large user‑controlled allocation	DoS	Medium
+11. Your Bug Bounty Checklist from This Chapter
+When testing any API, do this:
+
+Check for injection in every parameter (query, body, headers, cookies):
+
+Single quote '
+
+Double quote "
+
+Backtick `
+
+Semicolon ;
+
+Double dash --
+
+' OR 1=1 --
+
+1; WAITFOR DELAY '00:00:05' --
+
+Check error messages:
+
+Do they reveal DB type, file paths, library versions?
+
+Are they different for “user not found” vs “wrong password”?
+
+Check security headers:
+
+Use curl -I https://api.example.com/endpoint
+
+Look for missing X-Content-Type-Options, CSP, X-Frame-Options
+
+Check for reflected input:
+
+Send <script>alert(1)</script> in any parameter.
+
+See if it appears in response (even in JSON).
+
+Check Content-Type handling:
+
+Send Content-Type: text/plain with JSON body – does it still work? (possible SSRF or desync)
+
+Check for mass assignment (not in this chapter but relevant):
+
+Add extra fields to JSON – does it update unexpected DB columns?
+
+12. Key Quotes to Remember
+“Prepared statements eliminate SQL injection if used consistently.”
+
+“Be strict in what you accept – require correct Content-Type, validate inputs.”
+
+“Never echo user input back without validation – XSS hides in JSON responses.”
+
+“Error responses are often the weakest link – fix headers and content there too.”
+
