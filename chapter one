@@ -1,0 +1,76 @@
+Key Takeaways from Chapter 1 – API Security for Bug Bounty
+This chapter lays the foundation for API security. As a bug bounty hunter, focus on the attack surface, threat types (STRIDE), and security mechanisms that are often misconfigured or missing.
+
+1. What Makes APIs Vulnerable?
+APIs are designed for ease of use → same property makes them easy to abuse.
+
+APIs often expose multiple operations with different permission levels – privilege escalation opportunities.
+
+Combinations of safe operations can be unsafe (e.g., deposit + withdrawal vs. transfer).
+
+Implementation flaws: missing input size checks → DoS; improper authz → IDOR.
+
+2. Security Goals (CIA Triad) – What to Test For
+Confidentiality – Can you read someone else’s data? (IDOR, broken object level auth)
+
+Integrity – Can you modify/delete data you shouldn’t?
+
+Availability – Can you crash the API or exhaust resources? (rate limiting bypass, DoS)
+
+3. Threat Modeling with STRIDE – Your Bug Bounty Checklist
+Threat	What to look for in APIs
+Spoofing	Weak authentication, missing API key validation, JWT alg:none
+Tampering	No integrity checks on parameters, mass assignment, parameter pollution
+Repudiation	No audit logs – you can’t prove what happened, but as a hacker this helps you stay undetected
+Info Disclosure	Verbose errors, stack traces, GraphQL introspection left on, exposed debug endpoints
+Denial of Service	No rate limiting, expensive queries, large payloads accepted
+Elevation of Privilege	Horizontal/vertical authz flaws, admin endpoints accessible to normal users
+4. Security Mechanisms – Where Bugs Hide
+Encryption (HTTPS/TLS)
+Check for mixed content, weak ciphers, missing HSTS.
+
+TLS termination at proxy may leave internal traffic unencrypted – sometimes reachable.
+
+Authentication
+Common flaws: no authentication on sensitive endpoints, weak password policies, missing 2FA.
+
+Token-based auth (JWT): check for alg:none, weak secret, no expiration, kid injection.
+
+Access Control (Authorization)
+IDOR – change resource ID in URL/body to access another user’s data.
+
+Privilege escalation – normal user can call admin endpoints.
+
+Mass assignment – extra parameters in JSON/XML modify fields you shouldn’t control.
+
+Capability-based vs identity-based – look for tokens that act as “keys” that might be guessable or leaked.
+
+Audit Logging
+Lack of logs helps attackers cover tracks – but also means no alerting.
+
+If logs exist, test if they can be polluted (e.g., log injection via user-supplied data).
+
+Rate Limiting
+Bypasses: IP rotation (X-Forwarded-For spoofing?), different endpoints, slowloris style, no limits on registration/password reset → account takeover via brute force.
+
+5. Architecture Overlap – Attack Surface
+Typical path: Firewall → Load Balancer → Reverse Proxy / API Gateway → Your API.
+
+Misconfigurations in API gateways (e.g., overly permissive routing, stripping auth headers) are common.
+
+WAF bypass – encoding tricks, JSON vs form-urlencoded differences.
+
+6. Quick Bug Bounty Mindset from This Chapter
+Every API call is a potential entry point – check for missing auth on seemingly harmless endpoints (e.g., analytics, logging, configuration).
+
+Cross trust boundaries – data flows between client → API → backend → database. Test each boundary for injection or auth bypass.
+
+Think in STRIDE – when you see a feature, ask: Can I spoof? Tamper? Repudiate? Disclose? DoS? Escalate?
+
+7. Actionable Next Steps for Learning
+Practice on purposely vulnerable APIs (e.g., OWASP crAPI, Juice Shop API, Postman’s API security course).
+
+Master tools: Burp Suite (API tab, JSON/GraphQL parsers), Postman, curl for raw HTTP.
+
+Study OWASP API Security Top 10 – each item maps directly to the concepts above.
+
