@@ -1,0 +1,193 @@
+1. The Big Picture: How Security Controls Fit Together
+Think of a request arriving at your API. The controls are applied in this exact order:
+
+Rate limiting – Stops an attacker (or a buggy client) from overwhelming your server.
+
+Encryption (HTTPS) – Protects data in transit from eavesdropping and tampering.
+
+Authentication – Verifies who the user is (using passwords).
+
+Audit logging – Records every request (who did what and when).
+
+Access control – Checks if the authenticated user has permission for this action.
+
+This ordering is deliberate:
+
+Rate limiting must happen first because it uses minimal resources and protects everything else.
+
+Authentication doesn’t reject a request immediately if it fails; it just leaves the request “anonymous.” That way audit logging still records the attempt.
+
+Access control can then reject anonymous (or unauthorized) requests with a 401 or 403 status.
+
+Key concept: Only rate limiting and access control directly reject requests. Everything else runs in the background.
+
+2. Rate Limiting – Stopping DoS Attacks
+Why? Attackers can flood your API with millions of requests, crashing it. Rate limiting ensures you only process what your server can handle.
+
+How? Use Google Guava’s RateLimiter. It’s a simple library that lets you say “allow only X requests per second.”
+
+Implementation steps:
+
+Add Guava dependency to pom.xml.
+
+Create a RateLimiter object early in your main method.
+
+Use a Spark before filter (the very first filter!) to check if the limit is exceeded. If yes, immediately halt with 429 Too Many Requests and a Retry-After header (so the client knows when to try again).
+
+Example code snippet:
+
+java
+var rateLimiter = RateLimiter.create(2.0d); // 2 requests per second
+
+before((request, response) -> {
+    if (!rateLimiter.tryAcquire()) {
+        response.header("Retry-After", "2");
+        halt(429);
+    }
+});
+Production tip: Put rate limiting on a load balancer/reverse proxy if possible, but keep a per‑server limit as defense in depth.
+
+3. Authentication – Proving Who You Are
+Why? Without authentication, anyone can pretend to be someone else (spoofing).
+
+Approach: HTTP Basic Authentication + secure password storage with Scrypt.
+
+3.1 How Basic Auth Works
+The client sends an Authorization header:
+Authorization: Basic ZGVtbzpjaGFuZ2VpdA==
+That string is username:password encoded in Base64. (Not encrypted! That’s why HTTPS is mandatory.)
+
+3.2 Storing Passwords Securely
+Never store raw passwords. Use a password hashing function like Scrypt. It’s deliberately slow and memory‑hard, so attackers can’t quickly try millions of guesses even if they steal the database.
+
+Each password gets a unique random salt (so two users with the same password have different hashes).
+
+The Scrypt library stores the salt, cost parameters, and hash in one string. When checking a password, it extracts the salt and parameters, re‑hashes, and compares.
+
+Creating a user (in UserController.registerUser):
+
+Validate username (pattern [a-zA-Z][a-zA-Z0-9]{1,29}) and password length (≥ 8).
+
+Hash password:
+SCryptUtil.scrypt(password, 32768, 8, 1)
+(Values chosen for ~100ms on a single CPU; adjust only if absolutely necessary.)
+
+Store username and hash in the users table using a prepared statement (prevents SQL injection).
+
+3.3 Authenticating Every Request
+Add a Spark before filter that:
+
+Reads the Authorization header (if present and starts with “Basic ”).
+
+Decodes the Base64 to get username:password.
+
+Looks up the hash in the database by user_id.
+
+Uses SCryptUtil.check(password, hash) to verify.
+
+If successful, sets request.attribute("subject", username).
+
+Important: This filter does not reject the request on failure. That’s for access control later.
+
+Then in your business logic (e.g., creating a space or posting a message), check that the owner/author field matches the subject attribute.
+
+4. Encryption – Protecting Data in Transit (and at Rest)
+Why? Without encryption, passwords and messages travel over the network in clear text—anyone on the same WiFi can read them.
+
+How? Enable HTTPS (HTTP over TLS). Spark makes it easy:
+
+java
+secure("localhost.p12", "changeit", null, null);
+Get a certificate:
+
+Use mkcert to create a locally trusted CA and generate a PKCS#12 certificate for localhost.
+
+Never use self‑signed certs in production; for development, mkcert works smoothly because your browser trusts its CA.
+
+Bonus: Add an HTTP Strict‑Transport‑Security (HSTS) header to tell browsers to always use HTTPS:
+
+java
+response.header("Strict-Transport-Security", "max-age=31536000");
+(Not needed for pure APIs, but good if you ever serve web pages.)
+
+Encrypt at rest is also mentioned (database encryption) but covered in chapter 5.
+
+5. Audit Logging – Who Did What and When
+Why? Accountability. If something bad happens, you need to trace it. Also logs failed attempts (potential attacks).
+
+Where? After authentication, before access control. So you log even attempts that get denied.
+
+Implementation:
+
+Create an audit_log table (with columns: audit_id, method, path, user_id, status, audit_time).
+
+Two filters:
+
+auditRequestStart – runs before request processing; generates a unique audit_id and inserts a row (status NULL).
+
+auditRequestEnd – runs after; updates the same audit_id with the response status.
+
+This pair lets you correlate a request with its response and see if the server crashed mid‑processing (no end log).
+
+Reading logs: Provide a secured (or at least restricted) endpoint to view recent logs. In the book, they use a simple SELECT with a 1‑hour window and limit.
+
+Principle of separation of duties: The people who review audit logs (auditors) should be different from the system administrators who could otherwise cover their tracks.
+
+6. Access Control – Enforcing Permissions
+Why? You’ve proven who the user is, but should they be allowed to read, post, or delete in this space? Access control (authorization) enforces that.
+
+Key distinction:
+
+401 Unauthorized – “I don’t know who you are.” (Authentication failed.)
+
+403 Forbidden – “I know who you are, but you’re not allowed to do that.” (Authorization failed.)
+
+6.1 Require Authentication for All /spaces Routes
+A filter that checks request.attribute("subject") isn’t null. If null → halt(401) with a WWW-Authenticate header.
+
+6.2 Simple Access Control Lists (ACL)
+Create a permissions table linking space_id, user_id, and a string like "r", "w", "d" (read, write, delete). When a space is created, grant "rwd" to the owner.
+
+To enforce permissions, a filter factory method requirePermission(method, permission) returns a Spark Filter. Inside that filter:
+
+If the HTTP method doesn’t match, do nothing (let it pass to another filter).
+
+Else, call requireAuthentication, then look up the user’s permissions for :spaceId.
+
+If the permission string does not contain the required letter → halt(403).
+
+Then you attach that filter to specific routes in Main:
+
+java
+before("/spaces/:spaceId/messages", userController.requirePermission("GET", "r"));
+get("/spaces/:spaceId/messages", spaceController::findMessages);
+6.3 Adding Members – Watch Out for Privilege Escalation
+When adding a member, the addMember method originally required only read ("r") permission. That meant a user with read‑only access could invite a new user with full "rwd" permissions—effectively giving themselves admin rights. Fix: Change the required permission to "rwd" so only moderators can add members. Always check that the permissions you grant don’t exceed what the granter themselves have.
+
+Summary: The Full Request Flow
+Here’s a visual recap of what happens when a request hits your API:
+
+text
+Request arrives
+  → Rate limiter (reject if over limit, 429)
+  → HTTPS decrypts and verifies integrity
+  → Authentication filter (sets subject if credentials valid, else null)
+  → Audit start log
+  → Access control filter (check subject & permissions; halt 401/403 if needed)
+  → Business logic
+  → Audit end log
+  → Response encrypted by HTTPS
+By implementing these five controls, you’ve protected against the six STRIDE threats:
+
+Spoofing → Authentication
+
+Tampering → Encryption (HTTPS) + Access control
+
+Repudiation → Audit logging
+
+Information disclosure → Encryption + Access control
+
+Denial of service → Rate limiting
+
+Elevation of privilege → Access control (properly designed)
+
