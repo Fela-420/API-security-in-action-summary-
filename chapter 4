@@ -1,1 +1,201 @@
+1. Why HTTP Basic Falls Short in Browsers
+HTTP Basic Authentication (sending username:password in Base64) is simple, but when used with web UIs it has serious problems:
 
+Password sent on every request – Increases exposure, and every microservice must handle it securely.
+
+Expensive password hashing – Scrypt (or bcrypt) is intentionally slow (~100ms). That limits you to ~10 logins per second per CPU core, killing scalability.
+
+Ugly browser pop‑up – The default login dialog cannot be customised, and there’s no “logout” button; closing the tab may still keep the password cached.
+
+No way to “forget” the credentials – On shared computers, the next user can just hit back and reuse the stored password.
+
+Because of these drawbacks, we switch to token‑based authentication. The user logs in once, receives a short‑lived token, and sends that token on subsequent requests. The password is only checked once, reducing load and risk.
+
+2. The Token‑Based Authentication Flow
+The client calls a dedicated login endpoint (POST /sessions) with the username and password (still using Basic auth for this single call).
+
+The server verifies the password (via the existing UserController) and creates a token (a random string) associated with that user and an expiry time.
+
+The token ID is returned to the client.
+
+On every future API call, the client sends the token instead of the password.
+
+The server looks up the token in a token store to identify the user.
+
+For browser clients, the token is usually stored in a cookie (a session cookie). The browser automatically attaches cookies to same‑origin requests, making client development easier—but also introducing new attacks that we must defend against.
+
+3. Building an Abstract Token Store
+To keep the design flexible, the chapter creates a TokenStore interface and a Token class.
+
+Token class (com.manning.apisecurityinaction.token.Token):
+
+expiry – the time after which the token is invalid.
+
+username – the authenticated user.
+
+attributes – a ConcurrentHashMap for any extra data (e.g., auth method, permissions).
+
+TokenStore interface:
+
+String create(Request request, Token token) – Creates a token and returns its ID.
+
+Optional<Token> read(Request request, String tokenId) – Looks up a token; returns empty if expired or missing.
+
+void revoke(Request request, String tokenId) – Later added for logout.
+
+This abstraction lets you swap implementations (cookie‑based, database, self‑contained tokens in later chapters).
+
+4. The Login Endpoint
+The TokenController handles login. It does not verify the password itself; instead, it relies on the existing UserController filter that already performs HTTP Basic authentication. The flow:
+
+A before filter requires authentication for POST /sessions (so the user must send a valid Authorization: Basic ... header).
+
+If authentication succeeds, the UserController sets request.attribute("subject") to the username.
+
+The TokenController.login method:
+
+Reads subject from the request.
+
+Creates a Token object with an expiry (e.g., 10 minutes from now).
+
+Calls tokenStore.create(request, token) to obtain a token ID.
+
+Returns a JSON response containing the token ID.
+
+At this point we haven’t built a real store, so we wire it with null until we implement one.
+
+5. Implementing Session Cookies with Spark
+Spark provides built‑in session management via request.session(). When you call request.session(true), Spark:
+
+Checks for an existing session cookie (JSESSIONID).
+
+If none, generates a new random session ID, stores session attributes server‑side, and sets a Set-Cookie header.
+
+Returns a Session object that you can use to store attributes.
+
+Our first CookieTokenStore (naive version) does:
+
+create(): Gets a session (creating one if needed), stores username, expiry, and attributes as session attributes, returns the session ID.
+
+read(): Gets the session without creating one (false), reads attributes back into a Token.
+
+This naive version is vulnerable to session fixation.
+
+Session Fixation Attack
+If an attacker can inject a known session ID into a victim’s browser (e.g., via a URL parameter, XSS, or subdomain compromise) and the server does not change the session ID after login, the attacker’s session becomes authenticated as the victim. To fix:
+
+In create(), first check if a session already exists with request.session(false).
+
+If it does, invalidate it (session.invalidate()).
+
+Then create a fresh session. Now the old (attacker‑controlled) session is destroyed.
+
+6. Cookie Security Attributes
+When setting a cookie, you can add flags to protect it:
+
+Attribute	Purpose
+Secure	Cookie sent only over HTTPS; prevents network sniffing.
+HttpOnly	Cookie inaccessible to JavaScript; mitigates XSS theft.
+SameSite	Cookie sent only for same‑site requests; defends against CSRF.
+Domain	If omitted, cookie is host‑only (not sent to subdomains). Overly broad domains risk subdomain hijacking.
+Path	Restricts cookie to a specific URL path; limited security benefit.
+Expires / Max‑Age	Controls cookie lifetime; avoid making session cookies persistent (they should disappear when the browser closes).
+Spark automatically sets Secure and HttpOnly on its session cookies. For extra protection, use the __Host- prefix to enforce that the cookie is host‑only and secure (e.g., __Host-session).
+
+7. Validating Session Cookies in the API
+After login, we need the API to accept the session token as authentication, just like it did for Basic auth. The existing flow expects the subject attribute to be set. We add a new before filter (tokenController::validateToken) that runs right after the Basic auth filter.
+
+The naive validateToken calls tokenStore.read(request, null) (because the cookie token is implicit) and, if a valid token exists, sets request.attribute("subject", token.username). If neither Basic nor token auth succeeds, the subject remains null and access control will reject the request.
+
+But this naive version is vulnerable to CSRF—any cross‑origin request will automatically include the cookie, allowing an attacker to make authenticated requests on the user’s behalf without their knowledge.
+
+8. Cross‑Site Request Forgery (CSRF)
+A CSRF attack works because browsers attach cookies to all requests to a domain, even those initiated by a different site (e.g., a malicious page you visit). The attacker’s JavaScript cannot read the response (due to the same‑origin policy), but the request is still sent, and any state‑changing actions (like posting a message) are executed.
+
+The chapter introduces two layers of defence:
+
+8.1 SameSite Cookies
+Setting SameSite=strict (or lax) instructs the browser to send the cookie only for requests originating from the same site (i.e., same registrable domain). Cross‑site requests (like from evil.com) will not include the cookie. This is a great first line of defence, but it:
+
+Does not protect against subdomain hijacking (an attacker on evil.example.com can still set cookies for example.com).
+
+Still needs a second layer for full protection.
+
+8.2 Double‑Submit Cookie Pattern
+The server generates an anti‑CSRF token that must be sent both as a cookie and as a custom HTTP header (e.g., X-CSRF-Token). The browser’s same‑origin policy prevents cross‑origin scripts from reading the cookie (if it’s not HttpOnly), so they cannot forge the header. The server checks that the two values match.
+
+Traditional double‑submit has a flaw: if an attacker can overwrite the anti‑CSRF cookie (e.g., via a subdomain or XSS), they can set a known value and then supply the matching header, bypassing the defence.
+
+8.3 Hash‑Based Double‑Submit (The Secure Fix)
+Instead of a second random cookie, derive the anti‑CSRF token from the session cookie itself using a cryptographic hash (SHA‑256). The anti‑CSRF token = base64url(sha256(sessionId)).
+
+Why this is stronger:
+
+The attacker cannot compute the hash because they don’t know the session ID (it’s HttpOnly and sent only over HTTPS).
+
+Even if an attacker can overwrite the anti‑CSRF cookie, they cannot make it match the session cookie because they can’t compute the correct hash. Any mismatch will be detected.
+
+The server compares the hash of the real session ID with the value sent in the header.
+
+The chapter implements this in CookieTokenStore:
+
+create() now returns Base64url.encode(sha256(session.id())) instead of the raw session ID.
+
+read() takes a tokenId parameter (the value from the X-CSRF-Token header), computes the expected hash, and uses constant‑time comparison (MessageDigest.isEqual) to compare them. If they don’t match, the token is rejected.
+
+Constant‑time comparison prevents timing attacks that could otherwise leak the token byte‑by‑byte. Never use normal string comparison for secrets.
+
+9. Updating the Validation Filter
+TokenController.validateToken now reads the anti‑CSRF token from the X-CSRF-Token header. If the header is missing, the request is treated as unauthenticated (subject not set). If present, it calls tokenStore.read(request, tokenId), which performs the hash check internally.
+
+This ensures that:
+
+Requests without the header are blocked (CSRF prevented).
+
+Requests with a tampered cookie or header are rejected.
+
+10. Building the Login UI
+The browser UI is a simple HTML page (login.html) with a form for username and password. The JavaScript (login.js) does the following:
+
+On form submit, prevents default submission.
+
+Constructs a Basic auth header by Base64‑encoding username:password (using btoa()).
+
+Calls POST /sessions with that header.
+
+If successful, extracts the token from the JSON response and sets a csrfToken cookie:
+document.cookie = 'csrfToken=' + token + ';Secure;SameSite=strict';
+(Not HttpOnly, because JavaScript must read it later).
+
+Redirects to the main application page (/natter.html).
+
+One detail: the chapter removes the WWW-Authenticate header from 401 responses to prevent the browser from showing its own ugly login dialog. While technically a violation of HTTP specs, this is a common pattern when using token‑based auth.
+
+11. Updating the Main UI to Include the CSRF Token
+In natter.js, the createSpace function (and later other API calls) must:
+
+Read the csrfToken cookie using a helper getCookie() function.
+
+Include it as the X-CSRF-Token header on every fetch request.
+
+If a 401 response is received, redirect to the login page.
+
+Now the full flow works: login → set cookies → API calls carry both the session cookie and the matching CSRF header.
+
+12. Implementing Logout
+Logout must invalidate the token server‑side, not just delete the cookie. The TokenStore interface gets a revoke method. For cookies, it simply invalidates the session: session.invalidate(). This removes the server‑side state and tells the browser to delete the cookie (by setting an expired Set-Cookie header).
+
+The logout endpoint is DELETE /sessions (no token in URL, to avoid leaking it in logs). It reads the token ID from the X-CSRF-Token header, performs the same hash verification (to prevent CSRF logouts), and then calls tokenStore.revoke().
+
+Key Takeaways
+Token‑based auth separates the one‑time password check from everyday requests.
+
+Session cookies are the simplest implementation for same‑origin UIs, but they need careful protection.
+
+Session fixation is prevented by always creating a new session after login.
+
+Cookie security attributes (Secure, HttpOnly, SameSite, __Host- prefix) are essential.
+
+CSRF attacks are defeated by requiring a custom header containing a value derived from the session cookie itself (hash‑based double‑submit). Constant‑time comparison stops timing leaks.
+
+Logout must invalidate the token server‑side.
