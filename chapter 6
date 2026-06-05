@@ -1,0 +1,473 @@
+1. Why Move Away from the Database?
+Until now, every token (whether in a cookie, localStorage, or Bearer header) had its state stored in a central database. When your API validates a request, it queries the database to see if the token exists, who it belongs to, and when it expires. This works perfectly for small systems, but as traffic grows, the database becomes a bottleneck. Every request requires a database round‑trip, and if the database goes down, authentication stops entirely.
+
+Self‑contained tokens solve this by packing all necessary state into the token string itself. The token is cryptographically protected so that the server can validate it without any database lookup. This is the stateless token model.
+
+The simplest version: take the token’s data (username, expiry, attributes), convert it to JSON, Base64url‑encode it, and send that as the token. But that’s completely insecure—anyone can edit the JSON and impersonate someone else. So we need HMAC to authenticate the token.
+
+2. Basic Self‑Contained Token with HMAC
+We already have the building blocks from chapter 5: the HmacTokenStore. It takes any TokenStore and appends an HMAC tag so the token can’t be forged. So if we create a JsonTokenStore that just encodes/decodes token data to/from JSON (and Base64url), and then wrap it with HmacTokenStore, we get a secure, stateless token.
+
+2.1 JsonTokenStore
+java
+public class JsonTokenStore implements TokenStore {
+    @Override
+    public String create(Request request, Token token) {
+        var json = new JSONObject();
+        json.put("sub", token.username);         // subject
+        json.put("exp", token.expiry.getEpochSecond()); // expiry
+        json.put("attrs", token.attributes);     // any extra data
+        var jsonBytes = json.toString().getBytes(UTF_8);
+        return Base64url.encode(jsonBytes);
+    }
+
+    @Override
+    public Optional<Token> read(Request request, String tokenId) {
+        // Decode Base64 → JSON → extract fields
+        // Return new Token(expiry, username) with attributes
+    }
+}
+Create turns the token into a JSON string, then Base64url‑encodes it.
+
+Read reverses the process. If the JSON is malformed, it returns empty.
+
+2.2 Adding HMAC
+java
+TokenStore tokenStore = new JsonTokenStore();
+tokenStore = new HmacTokenStore(tokenStore, macKey);
+Now tokenStore.create() will:
+
+Call JsonTokenStore.create() to get the plain JSON token string.
+
+Compute HMAC-SHA256(key, tokenString), append it as tokenString + '.' + Base64url(tag).
+
+When validating, the HmacTokenStore verifies the tag before ever calling the underlying store. If the tag is invalid, the token is rejected immediately.
+
+Result: A token that is completely stateless, yet tamper‑proof. The server only needs the secret key to verify authenticity—no database.
+
+But this token is not encrypted. The user (or an attacker who steals it) can decode the Base64 and see all the claims (username, expiry, attributes). In many cases that’s fine, but if you need confidentiality (e.g., internal user IDs, permissions), you must encrypt.
+
+3. Enter JSON Web Tokens (JWTs)
+JWTs are the industry standard for self‑contained tokens. They look almost exactly like our HMAC‑protected JSON token, but with an extra header that describes the cryptographic algorithm used.
+
+3.1 JWT Structure (JWS Compact Serialization)
+text
+base64(header) . base64(payload) . base64(signature)
+Header: JSON like {"alg":"HS256"} (HMAC with SHA‑256).
+
+Payload (claims): JSON with standard claims like sub (subject), exp (expiry), aud (audience), iat (issued‑at), etc., plus custom claims.
+
+Signature: computed over header + '.' + payload with the key.
+
+Example (decoded):
+
+json
+// Header
+{"alg":"HS256"}
+// Payload
+{"sub":"test","aud":"https://localhost:4567","exp":1577007872,"attrs":{}}
+The standard defines many claims. The most important ones for API security:
+
+Claim	Meaning	Why it matters
+sub	Subject (username)	Identifies the user.
+exp	Expiration time	Must be enforced; reject expired tokens.
+aud	Audience	Who the token is meant for (your API). A token issued for service A must not be accepted by service B.
+iss	Issuer	Who created the token. Verify if you trust multiple issuers.
+jti	JWT ID	Unique ID to detect replay or to revoke (later).
+3.2 The Danger Zone: The alg Header and Key Confusion
+The JOSE standard lets the sender tell you which algorithm to use. This is a security anti‑pattern. If an attacker can change "alg":"HS256" to "alg":"none", some faulty libraries skip signature verification. Even worse, if you use a public‑key algorithm (RS256) but the server trusts the alg header, an attacker can change it to HS256 and sign with the public key (which is actually the server’s HMAC secret in a confusion attack).
+
+Best practice:
+
+Do not trust the alg header. Instead, associate the algorithm with the key on the server side.
+
+Use libraries that let you specify the expected algorithm (like Nimbus does by passing a JWSAlgorithm).
+
+Prefer headless JWTs (omit the header) when you control both sides—just rebuild the expected header before verification.
+
+3.3 Generating Standard JWTs with Nimbus
+We use the Nimbus JOSE+JWT library, a well‑maintained Java library.
+
+java
+public class SignedJwtTokenStore implements TokenStore {
+    private final JWSSigner signer;
+    private final JWSVerifier verifier;
+    private final JWSAlgorithm algorithm; // e.g., HS256
+    private final String audience;        // "https://localhost:4567"
+
+    public SignedJwtTokenStore(JWSSigner signer, JWSVerifier verifier,
+                               JWSAlgorithm algorithm, String audience) {
+        this.signer = signer;
+        this.verifier = verifier;
+        this.algorithm = algorithm;
+        this.audience = audience;
+    }
+
+    @Override
+    public String create(Request request, Token token) {
+        var claimsSet = new JWTClaimsSet.Builder()
+                .subject(token.username)
+                .audience(audience)
+                .expirationTime(Date.from(token.expiry))
+                .claim("attrs", token.attributes)
+                .build();
+        var header = new JWSHeader(algorithm);
+        var jwt = new SignedJWT(header, claimsSet);
+        jwt.sign(signer);
+        return jwt.serialize();   // produces the compact serialization
+    }
+}
+The signer is a MACSigner initialized with the same HMAC key we already have.
+
+The algorithm is JWSAlgorithm.HS256.
+
+The audience is set and later checked.
+
+3.4 Validating a JWT Safely
+java
+@Override
+public Optional<Token> read(Request request, String tokenId) {
+    try {
+        var jwt = SignedJWT.parse(tokenId);
+        // Verify signature using the verifier (ensures algorithm matches key)
+        if (!jwt.verify(verifier)) {
+            return Optional.empty();
+        }
+
+        var claims = jwt.getJWTClaimsSet();
+        // 1. Validate audience
+        if (!claims.getAudience().contains(audience)) {
+            return Optional.empty();
+        }
+        // 2. Expiry check (TokenController will also do its own check)
+        var expiry = claims.getExpirationTime().toInstant();
+        var subject = claims.getSubject();
+        var token = new Token(expiry, subject);
+        // extract custom attributes
+        ...
+        return Optional.of(token);
+    } catch (ParseException | JOSEException e) {
+        return Optional.empty();  // Never reveal why
+    }
+}
+Key points:
+
+Always verify the signature with a verifier that is bound to a specific algorithm.
+
+Always check that your API’s identifier is in the aud claim.
+
+Do not expose error details that might help an attacker.
+
+This gives you a standards‑compliant signed JWT. But the claims are still in plaintext (just Base64). That’s fine for some data, but if you need to hide the user’s internal ID or permissions, you must encrypt.
+
+4. Encrypting Token Contents
+Encryption provides confidentiality, but pure encryption does not prevent tampering. So we need authenticated encryption (encryption + MAC). The modern safe way is to use an AEAD algorithm like AES‑GCM, or an Encrypt‑then‑MAC construction like AES‑CBC + HMAC (used by JWE).
+
+4.1 The Simplicity of NaCl’s SecretBox
+The Salty Coffee library (a Java implementation of NaCl) offers a dead‑simple API: SecretBox.encrypt(key, plaintext) and box.decryptToString(key). It uses XSalsa20‑Poly1305, a modern authenticated cipher. You don’t have to worry about IVs, modes, or MACs—the library handles everything securely.
+
+We can build an EncryptedTokenStore that wraps any underlying TokenStore:
+
+java
+public class EncryptedTokenStore implements TokenStore {
+    private final TokenStore delegate;
+    private final Key encryptionKey;
+
+    @Override
+    public String create(Request request, Token token) {
+        // Let the delegate produce the plain token ID (could be JSON, JWT, etc.)
+        var rawToken = delegate.create(request, token);
+        // Encrypt it (authenticated)
+        return SecretBox.encrypt(encryptionKey, rawToken).toString();
+    }
+
+    @Override
+    public Optional<Token> read(Request request, String tokenId) {
+        var box = SecretBox.fromString(tokenId);
+        var rawToken = box.decryptToString(encryptionKey);
+        return delegate.read(request, rawToken);
+    }
+}
+Now the token string on the client is a random‑looking encrypted blob. Only the server with the secret key can decrypt it. The inner structure (the actual token data) is completely hidden.
+
+4.2 JWE – Standard Encrypted JWTs
+If you need a standard format for interoperability, JWE (JSON Web Encryption) is the JOSE equivalent. A JWE compact serialization has five parts:
+
+text
+header.encryptedKey.iv.ciphertext.tag
+Header: contains alg (key management) and enc (encryption method).
+
+Encrypted Key: empty for direct encryption (dir).
+
+IV: initialization vector (random).
+
+Ciphertext: the encrypted payload.
+
+Tag: the authentication tag.
+
+For direct symmetric encryption, we use:
+
+alg = dir
+
+enc = A128CBC-HS256 (AES‑CBC + HMAC‑SHA256, a safe Encrypt‑then‑MAC) or A256GCM.
+
+We implement EncryptedJwtTokenStore using Nimbus:
+
+java
+var header = new JWEHeader(JWEAlgorithm.DIR, EncryptionMethod.A128CBC_HS256);
+var jwt = new EncryptedJWT(header, claimsBuilder.build());
+var encrypter = new DirectEncrypter(encKey);
+jwt.encrypt(encrypter);
+return jwt.serialize();
+Decryption:
+
+java
+var jwt = EncryptedJWT.parse(tokenId);
+var decryptor = new DirectDecrypter(encKey);
+jwt.decrypt(decryptor);
+// then extract claims
+Security: The library internally verifies the authentication tag. If decryption fails for any reason (bad tag, wrong key), we must return a generic error—never tell the client why. Otherwise, padding oracle attacks could leak plaintext.
+
+Important: Always use an IV from SecureRandom. For JWE, the library handles that automatically. If you implement encryption yourself, never reuse an IV with the same key.
+
+5. Making Secure Choices Hard to Get Wrong – Type Safety
+A common security antipattern is a “kit of parts” design where developers can accidentally assemble insecure combinations. For example, using JsonTokenStore without HMAC or encryption. We can prevent this with marker interfaces:
+
+ConfidentialTokenStore – guarantees encryption.
+
+AuthenticatedTokenStore – guarantees tamper‑proof (e.g., HMAC).
+
+SecureTokenStore – extends both, so it requires both properties.
+
+The TokenController now demands a SecureTokenStore:
+
+java
+public TokenController(SecureTokenStore tokenStore) { ... }
+Now the compiler will reject any token store that doesn’t provide both confidentiality and integrity. We adjust the existing stores:
+
+CookieTokenStore and DatabaseTokenStore (if properly hardened) can implement SecureTokenStore.
+
+JsonTokenStore stays as a plain TokenStore.
+
+SignedJwtTokenStore (JWS) is only AuthenticatedTokenStore.
+
+EncryptedJwtTokenStore is both, so implements SecureTokenStore.
+
+HmacTokenStore returns SecureTokenStore if the wrapped store is ConfidentialTokenStore, otherwise only AuthenticatedTokenStore.
+
+This makes misuse almost impossible.
+
+6. The Hard Problem: Token Revocation
+Since the server stores no token state, how do you revoke a token (logout, password change, etc.)? The token is out there, still cryptographically valid.
+
+Options:
+Strategy	How it works	Drawback
+No revocation	Just let tokens expire.	No logout; attacker can use token until expiry.
+Blocklist	Keep a set of revoked token IDs in a database until they expire.	Need a DB query per request; becomes a bottleneck if many tokens are revoked.
+Allowlist	Store a unique ID for every valid token in a DB. Revocation deletes the record.	Must query DB on every validation – we’re back to database bottleneck.
+Short‑lived tokens	Tokens expire in minutes; use refresh tokens to get new ones.	Good UX if transparent (OAuth2), but still requires server state.
+Hybrid	Store a minimal allowlist (just the JWT’s jti ID) in the database, but perform less critical operations without checking.	Best of both: immediate revocation when needed; most requests skip DB.
+The book implements the hybrid allowlist approach. It re‑uses DatabaseTokenStore as an allowlist, but stores only a tiny record (just expiry and username). The JWT carries the database token ID as the jti claim.
+
+6.1 Creating a Token with Allowlist
+java
+var allowlistToken = new Token(token.expiry, token.username);
+var jwtId = tokenAllowlist.create(request, allowlistToken);  // returns a random ID
+
+// Build JWT and embed that ID
+var claimsBuilder = new JWTClaimsSet.Builder()
+    .jwtID(jwtId)          // <-- link to allowlist entry
+    .subject(...)
+    .audience(...)
+    .expirationTime(...);
+The database now has an entry for this token. To revoke it, we delete that entry.
+
+6.2 Validating with Allowlist
+java
+var claims = jwt.getJWTClaimsSet();
+var jwtId = claims.getJWTID();
+if (tokenAllowlist.read(request, jwtId).isEmpty()) {
+    return Optional.empty();   // token was revoked
+}
+This adds a database lookup only when we need to ensure the token hasn’t been revoked. For low‑risk operations (e.g., reading public data), you might skip the DB check and just rely on the JWT’s expiry.
+
+This hybrid design gives you immediate revocation when necessary, while still letting most requests remain stateless.
+
+Summary of Core Concepts
+Self‑contained tokens pack user identity and expiry into the token, protected by HMAC (integrity) and optionally encryption (confidentiality).
+
+JWTs are the standard format. Avoid their dangerous flexibility: never trust the alg header; always validate aud; use well‑vetted libraries.
+
+Authenticated encryption (NaCl’s SecretBox, JWE with AES‑CBC+HMAC) provides both privacy and tamper resistance in one step.
+
+Type‑safe design with marker interfaces (SecureTokenStore) prevents developers from accidentally skipping encryption or signing.
+
+Token revocation is the weak point. A hybrid allowlist (store a minimal DB entry linked to the JWT’s jti) gives you the best of both worlds: stateless validation for most operations, with instant revocation when required.
+
+
+
+
+
+
+ 
+  
+  
+  JWT & Self‑Contained Token Testing Checklist
+JWTs are everywhere, and misconfigurations can lead to full account takeover. Use this step‑by‑step guide to find high‑impact bugs.
+
+1. Identify JWT Usage
+Look for tokens in:
+Authorization: Bearer <token> header, cookies (often access_token), POST bodies, URL parameters (?token=...), or custom headers like X-Auth-Token.
+
+JWT pattern: Three Base64‑encoded strings separated by two dots:
+
+text
+eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.abc123
+If you see one dot (e.g., data.hash) it might be a home‑grown HMAC token, not a standard JWT. Test similarly but skip JWT‑specific header attacks.
+
+2. Decode & Map Claims
+Use https://jwt.io (only for non‑production tokens!) or a local script:
+
+bash
+echo "token" | cut -d. -f2 | base64 -d 2>/dev/null | jq .
+Note:
+
+sub – user identifier
+
+exp – expiry timestamp
+
+aud – intended audience (who should accept this token)
+
+iss – issuer
+
+iat, nbf – timestamps
+
+Any custom claims (role, email, is_admin, etc.)
+
+3. Algorithm Confusion Attacks
+This is the #1 JWT bug. Test these:
+
+a) alg: none (signature bypass)
+If the server trusts the alg header, change it to "none" and remove the signature.
+
+bash
+# craft header: {"alg":"none","typ":"JWT"}
+# payload: original payload (modify claims if needed)
+# signature: empty
+# final token: base64(header).base64(payload).
+Send request – if accepted, critical vulnerability.
+
+b) RS256 → HS256 Key Confusion
+If the server uses an RSA public key but the code doesn’t lock the algorithm, you can sign with the public key as an HMAC secret (since it’s a string).
+
+Steps:
+
+Obtain the server’s public key (often from /.well-known/jwks.json).
+
+Use a tool (like jwt_tool or Burp’s JWT Editor) to:
+
+Change alg to HS256.
+
+Sign the token with the public key as the HMAC secret.
+
+Send request. If accepted, you can forge any user.
+
+c) Weak HMAC secret (HS256)
+If the token uses HS256 and you can brute‑force the secret (e.g., a common word), you can sign arbitrary tokens. Test with jwt_tool or hashcat:
+
+bash
+jwt_tool <token> -C -d wordlist.txt
+Short, low‑entropy secrets are vulnerable.
+
+4. Key Injection via kid, jwk, jku
+These headers tell the server where to find the verification key.
+
+kid injection: If the kid value is used unsafely, you might achieve SQLi, path traversal, or command injection.
+
+json
+{"alg":"HS256","kid":"../../../etc/passwd"}
+(This works if the server reads the key from a file using the kid as filename.)
+
+jwk header: Embed your own public key. If the server trusts it, you can sign with your private key.
+
+json
+{"alg":"RS256","jwk":{"kty":"RSA","n":"...","e":"AQAB"}}
+Sign with matching private key.
+
+jku header: Provide a URL to a JWK Set you control. If the server fetches it, you can supply your own keys (SSRF opportunity too).
+
+json
+{"alg":"RS256","jku":"https://evil.com/jwks.json"}
+5. Missing / Insecure Claim Validation
+Even with a valid signature, a token might be misused.
+
+Expired token reuse (exp): Use a token after its expiry timestamp. If still accepted, no expiry enforcement.
+
+Not‑Before bypass (nbf): Similar, use a token before its activation time.
+
+Audience confusion (aud): A token issued for service A might be accepted by service B. Capture a token for one API and replay it to another endpoint that shares the same secret/public key.
+
+Issuer spoofing (iss): If the server doesn’t validate the issuer, a token from a less secure partner could be accepted.
+
+6. Revocation / Logout Bypass
+With stateless tokens, logout is hard.
+
+Log out and capture the token.
+
+Use the same token again. If it still works, there’s no server‑side revocation (or a long‑lived allowlist entry).
+
+Change password – often should invalidate all existing tokens. Repeat the same test; if old token still works, account takeover is possible after password reset.
+
+7. Sensitive Data Exposure
+Decode the JWT payload. Does it contain:
+
+Passwords (even hashed)?
+
+Internal user IDs, database IDs?
+
+Detailed roles/permissions that could be altered if encryption is missing?
+
+Personally Identifiable Information (PII)?
+
+If the token is only signed (JWS, not encrypted), all this data is visible to anyone who captures the token. This is a privacy bug, and if tokens are logged, they leak sensitive data.
+
+8. Injection via JWT Claims
+If any claim value is reflected in the application (e.g., in error messages, profile pages, logs), test for injection attacks:
+
+XSS: In sub, name, or custom claims.
+
+SQL injection: If the claim is used directly in a query.
+
+Template injection: Server‑side template engines.
+
+9. Downgrade from Encrypted to Signed
+If the API accepts both JWE (encrypted) and JWS (signed) tokens, you might be able to:
+
+Decrypt a JWE to see its plaintext (if the key is weak/compromised).
+
+Strip encryption: Remove encryption and present the token as a plain signed JWT. If the server accepts it, you bypass encryption completely.
+
+10. Predictable Token IDs (jti)
+If the jti claim is sequential or time‑based, you can enumerate valid tokens (if combined with other weaknesses). Capture multiple tokens and analyze jti patterns.
+
+🛠️ Tools
+Burp Suite + JWT Editor extension (manual tampering, signing).
+
+jwt_tool (https://github.com/ticarpi/jwt_tool) – swiss‑army knife for JWT testing.
+
+jwt-cracker (HS256 brute‑force).
+
+jwt.io – quick decoding (only for test data, never production tokens!).
+
+🚩 Quick Attack Table
+Attack	How	Severity
+alg: none	Remove signature, set alg to none	Critical
+RS256→HS256	Sign with public key	Critical
+jwk/jku injection	Supply your own key	Critical
+Weak HMAC secret	Brute‑force secret	High–Critical
+Expired token reuse	Use token after expiry	Medium–High
+Missing audience check	Replay token to other service	High
+No revocation	Token works after logout/ password change	High
+Plaintext sensitive data	Read claims from JWT	Medium–High
+kid injection	Path traversal / SQLi in key ID	Critical
+  
