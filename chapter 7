@@ -1,0 +1,238 @@
+OAuth2 & OpenID Connect – A Bug Bounty Hunter’s Guide
+This chapter is a goldmine for critical and high‑severity vulnerabilities. OAuth2 and OpenID Connect are complex protocols with many moving parts, and developers frequently misconfigure them. As a bug bounty hunter, you’ll look for everything from full account takeover via redirect_uri manipulation to privilege escalation through scope bypass. Let’s break down every concept and turn it into a testing checklist.
+
+1. Core Concepts (What You’ll Be Attacking)
+Component	Role	What You Care About
+Resource Owner (RO)	The user	Target’s browser
+Client	Third-party app (mobile, SPA, web)	The app you’ll abuse to get a token
+Authorization Server (AS)	Issues tokens after user consent	The OAuth provider (e.g., Google, custom)
+Resource Server (RS)	The API that holds data	Your real target – the API you want to break into
+Access Token	Credential to call the RS	The token you’ll try to steal, forge, or escalate
+Refresh Token	Long-lived credential to get new access tokens	Used for persistent access
+ID Token (OIDC)	JWT with user identity claims	Can leak PII, be misused for auth
+Scopes	Limit what the access token can do	Bypass/privilege escalation target
+PKCE	Code challenge/verifier for public clients	Often missing or incorrectly implemented
+State Parameter	Anti-CSRF token for OAuth flows	If missing or weak, CSRF login possible
+2. Reconnaissance – Mapping the OAuth Flow
+Identify OAuth endpoints
+
+Look for authorization_endpoint, token_endpoint, introspection_endpoint, revocation_endpoint in /.well-known/oauth-authorization-server or /.well-known/openid-configuration.
+
+Check client-side JavaScript for hard-coded endpoints.
+
+Identify client type
+
+Public or confidential? Public clients can’t keep a secret. If a mobile app has a client_secret, that’s a vulnerability.
+
+Check redirect_uri handling
+
+Is the redirect_uri parameter validated? Is it allowed to use arbitrary URIs? Open redirect? Pattern matching flaws?
+
+Observe the flow
+
+Capture the entire OAuth dance in Burp. Note every parameter (response_type, scope, state, code_challenge, nonce, etc.).
+
+3. Authorization Code Grant – The Most Common Flow
+3.1 The Attack Surface
+text
+GET /authorize?response_type=code&client_id=CLIENT&redirect_uri=...
+&scope=openid profile&state=XYZ&code_challenge=CHALLENGE&code_challenge_method=S256
+Vulnerabilities to test:
+
+a) Missing / Weak State Parameter (CSRF on Login)
+If the state parameter is missing or a static value, an attacker can craft a URL that logs the victim into the attacker’s account (Login CSRF).
+Test: Remove state, repeat the request. If the AS still redirects, and the client doesn’t validate state, you can link a victim’s session to your account.
+Impact: Account takeover on the client side (often high severity).
+
+b) Redirect URI Validation Bypass
+The redirect_uri must match the registered value exactly. Try:
+
+https://client.example.com/callback.attacker.com (subdomain trick)
+
+https://client.example.com@attacker.com (userinfo confusion)
+
+https://client.example.com/../attacker.com (path traversal)
+
+https://client.example.com%2f%2e%2e%2fattacker.com (URL encoding)
+
+Open redirect within the legitimate domain: if the client has an open redirect, you can chain it (e.g., https://client.com/redirect?url=https://evil.com).
+If the AS accepts it, you steal the authorization code.
+
+Test: Register your own client, try to set redirect_uri to an arbitrary domain. If you can, critical.
+
+c) PKCE Missing / Weak Implementation
+PKCE should be required for public clients. Test by:
+
+Removing code_challenge and code_challenge_method from the authorization request. If the AS still issues a code, PKCE is not enforced.
+
+Using plain code challenge method (the verifier is the challenge). Try to swap the code with another client’s code? (Hard, but if the code is predictable, you might attempt.)
+
+If PKCE is missing, an attacker who intercepts the authorization code (e.g., via a malicious app on the same device) can exchange it for a token.
+
+d) Authorization Code Injection / Replay
+If the authorization code is not single‑use or lacks a short expiry, try to reuse a code after it has been exchanged. Use your own client, obtain a code, then try to exchange it again (maybe in parallel). If it works, you might be able to race legitimate clients.
+
+e) Scope Escalation
+The client requests scopes; the user consents. But what if the client modifies the scope parameter in the token request after receiving the code? Some AS’s rely solely on the scope from the authorization request; others allow the token request to specify a different scope (or add scopes). Test:
+
+After getting a code with scope=read, at the token endpoint, send scope=read write delete. If the returned access token has higher privileges, that’s a critical scope escalation.
+
+f) Client Authentication Bypass
+Confidential clients must authenticate at the token endpoint. Try to exchange a code without the client_secret (or with a fake one). If it works, you can impersonate any client that doesn’t require a secret.
+
+4. Token Endpoint – Where Codes Become Tokens
+Request:
+
+text
+POST /token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code&code=...&redirect_uri=...&code_verifier=...
+Attacks:
+
+Code Reuse: as above.
+
+redirect_uri mismatch: Try to set a different redirect_uri than the one used in the authorization request. Some ASs only validate that the redirect URI is registered, not that it matches exactly. Could lead to code interception.
+
+PKCE bypass: If PKCE is required, try to send an empty code_verifier or the wrong one. If the server falls back, PKCE is not enforced.
+
+Client Secret in URL: If the client sends the secret as a query parameter (e.g., ?client_secret=...) in the token request, it may be logged in server logs or referrer headers.
+
+5. Token Validation – How the API Checks the Access Token
+5.1 Token Introspection Endpoint (Direct Call)
+The RS calls the AS’s introspection endpoint to validate the token. The API sends its own client credentials.
+
+Attacks:
+
+SSRF via introspection endpoint: If the RS trusts a user‑supplied introspection endpoint URI (e.g., from a header or JWT claim), you can point it to your server to validate arbitrary tokens.
+
+Missing TLS verification: If the RS doesn’t properly verify the TLS certificate of the introspection endpoint, you can MITM.
+
+Introspection endpoint authentication bypass: Try to call the introspection endpoint without credentials, or with weak/guessable credentials.
+
+Response manipulation: If the RS caches introspection responses, you might cause a timing attack or cache poisoning.
+
+Information leak: The introspection response often includes client_id, username, scope etc. Check if any sensitive fields are revealed to the RS unnecessarily.
+
+5.2 JWT Access Tokens
+When the access token is a JWT, the RS validates it locally.
+
+Critical JWT Attacks:
+
+alg=none: Remove signature, set header {"alg":"none"}. If accepted, full token forgery.
+
+RS256 → HS256 confusion: Change alg to HS256 and sign with the public key (obtained from JWK Set). If the RS uses the same key to verify HS256 signatures, you can forge any token.
+
+kid injection: If the kid header is used to fetch a key from a file/database/URL, try path traversal, SQL injection, or SSRF.
+
+JWK header injection: Include your own jwk key in the header. If the RS trusts it, you can sign with your key.
+
+jku header: Point to your own JWK Set URL. If the RS fetches it, you can supply any key.
+
+Missing aud validation: An access token for one API might be accepted by another API. Obtain a token for a low‑security API and replay to the target API.
+
+Missing exp check: Use an expired token.
+
+Scope claim tampering: If the token is only signed (not encrypted), modify the scope claim to add higher privileges. The RS should verify the scope against the token, but if it uses the user‑supplied scope, you can escalate.
+
+Sensitive data exposure: Decode the JWT – does it leak internal user IDs, email addresses, or roles? Report as PII leak.
+
+Where to get the public key:
+
+/.well-known/jwks.json
+
+The jwks_uri from the discovery document.
+
+Sometimes embedded in the client application.
+
+6. Refresh Token Abuse
+If the client receives a refresh token, it can be used to obtain new access tokens indefinitely.
+
+Tests:
+
+Refresh token reuse: After a refresh token is used, does the server issue a new refresh token and invalidate the old one? If not, an attacker who steals a refresh token can maintain access forever.
+
+Refresh token rotation bypass: Some implementations rotate refresh tokens but still accept the previous one for a grace period. Try to use an old refresh token after rotation.
+
+Scope escalation via refresh: When refreshing, can you request a different (wider) scope? If yes, critical.
+
+Refresh token in URL: If the refresh token is ever passed in a URL, it’s loggable.
+
+Refresh token for public clients: Public clients (SPA, mobile) should not receive refresh tokens or must use rotating refresh tokens with backend‑for‑frontend (BFF) pattern. Check if a SPA receives a long‑lived refresh token.
+
+7. Single Sign‑On & Session Management
+Session fixation on the AS: The AS might set a session cookie before authentication. If that cookie is not rotated after login, you can fixate a victim’s session.
+
+Logout not revoking tokens: Log out from the client, but the access/refresh token still works.
+
+Missing prompt=login enforcement: Try to re‑authenticate with prompt=none after revoking consent; if it still returns a token, the user’s session wasn’t terminated.
+
+8. OpenID Connect – The ID Token
+8.1 ID Token Leakage
+The ID token is a JWT containing user identity. If the client uses the implicit or hybrid flow, the ID token may appear in the URL fragment (implicit) or query string (hybrid).
+
+Test: Initiate a login and capture the redirect. Is the ID token in the location header? In the # fragment? In the query parameters? If query parameters, it leaks to Referer header and server logs.
+
+ID token in browser history: If the redirect uses a 302 with the ID token in the URL, it’s stored in history.
+
+8.2 ID Token Misuse as Access Token
+Some APIs accept an ID token in the Authorization: Bearer header. That’s broken because ID tokens are not scoped and have the client as audience, not the API.
+
+Test: Use an ID token obtained from the OP to call an API endpoint. If accepted, critical misuse.
+
+Audience confusion: Even if the API validates the audience, it may accept ID tokens intended for other clients if the audience includes the API’s identifier. Try to pass an ID token from a different client.
+
+8.3 Nonce Bypass
+The nonce parameter prevents replay attacks in implicit/hybrid flows. If missing or static, replay possible.
+
+8.4 acr/amr Downgrade
+The client can request strong authentication (acr_values=high). But the AS might not enforce it. Test by requesting a high assurance and see if the resulting ID token actually contains acr=high. If not, the client might trust a low‑assurance session.
+
+9. Common Misconfigurations and How to Find Them
+Issue	How to Test	Severity
+Arbitrary redirect_uri	Set redirect_uri to attacker.com	Critical
+PKCE not enforced	Remove code_challenge from authorize request	High
+Implicit grant used	Look for response_type=token or id_token token	High
+ROPC grant enabled	Try grant_type=password with user credentials	Medium
+Missing state parameter	Remove state, see if flow succeeds	High
+Client secret in mobile app	Decompile APK/IPA, search for secret	High
+Refresh token in SPA	Check browser storage for refresh token	High
+JWT alg=none	Change header to "alg":"none", remove signature	Critical
+JWT key confusion	Change RS256 to HS256, sign with public key	Critical
+Missing audience validation	Use access token from different API on target API	High
+Scope escalation	Modify scope in token request or in JWT claims	Critical
+ID token as access token	Send ID token to API endpoint	Critical
+TLS misconfig on introspection	Downgrade to HTTP, MITM	High
+10. Step‑by‑Step Testing Workflow
+Recon – Discover OAuth/OIDC endpoints, client IDs, redirect URIs.
+
+redirect_uri bypass – Try all techniques on authorization endpoint.
+
+CSRF via state – Repeat auth request without state or with static state.
+
+PKCE test – Remove code_challenge; see if token still issued.
+
+Scope escalation – In code exchange, ask for broader scope.
+
+JWT attacks – If access token is JWT, run jwt_tool with all tricks (none attack, key confusion, kid injection, jku).
+
+Token introspection – Check if endpoint is exposed, try to call without auth, check for SSRF.
+
+Refresh token – Steal from mobile/SPA, check rotation, try scope upgrade on refresh.
+
+ID token – Check if it’s exposed in URL, try to use as access token.
+
+Logout/revocation – Log out, see if tokens still work.
+
+Tools:
+
+Burp Suite (with OAuth extension if available)
+
+jwt_tool
+
+jwt.io (for decoding only – never put production tokens)
+
+jq for JSON
+
+Custom Python scripts for automation.
+
