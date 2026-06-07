@@ -1,0 +1,154 @@
+Chapter 8 – Identity-Based Access Control: A Bug Bounty Hunter’s Guide
+This chapter moves from simple ACLs to more scalable access control models: groups, role-based access control (RBAC), and attribute-based access control (ABAC). Each model has its own subtle weaknesses that can lead to privilege escalation, information disclosure, or authorization bypass. Let’s dissect everything and turn it into a testing methodology.
+
+1. Core Concepts and Where Vulnerabilities Hide
+1.1 Users and Groups
+Groups collect users to simplify permission assignment.
+
+Hierarchical groups: groups can be members of other groups.
+
+Permissions can be assigned to groups, and users inherit them.
+
+Attack surface:
+
+Group membership manipulation – if an attacker can add themselves to a privileged group (e.g., via parameter pollution, mass assignment, or SQL injection), they escalate privileges.
+
+Inconsistent group resolution – if the system looks up groups only at login but not later, changes to group membership (e.g., removal) might not take effect until the user re-authenticates.
+
+LDAP injection – if group membership queries are built dynamically without proper parameterization, an attacker could inject filters to make themselves a member of a privileged group. (See Listing 8.3 for the correct parameterized approach; many developers skip this.)
+
+Group name collision – if groups are stored in a different namespace from users, a user could register with a name matching a privileged group and trick the permission lookup (e.g., user_or_group_id column that mixes user IDs and group IDs).
+
+Missing access control on group management – if group membership can be altered without authorization, an attacker can add themselves to admin groups.
+
+1.2 Role-Based Access Control (RBAC)
+Roles are an intermediary: permissions → roles → users.
+
+Roles are typically application-specific; assignments are often static.
+
+Dynamic roles (time-based, context-based) can be misconfigured.
+
+Java EE / JAX-RS often uses @RolesAllowed annotations; if the filter is not applied, no enforcement.
+
+Attack surface:
+
+Missing role enforcement – endpoints lacking @RolesAllowed (or equivalent) are accessible to anyone.
+
+Role assignment manipulation – modifying the request to assign a higher role when creating a member (e.g., sending "role":"owner" instead of "member").
+
+Privilege escalation via insufficient validation – if the role parameter is not validated against a predefined list, an attacker could assign themselves arbitrary roles.
+
+Default roles – if no role is specified, the system might default to a high-privilege role (e.g., "owner") instead of a safe default like "observer".
+
+Missing re-authentication – after a role change, the user’s existing session/token may still carry old permissions.
+
+Role hierarchy bypass – if roles are supposed to be mutually exclusive or inherited, but the logic is flawed, a user might combine roles for extra permissions.
+
+Session roles (NIST RBAC) – if a user can activate a subset of roles, can they activate a role they no longer have? Or activate a role without proper authentication?
+
+Direct role references – if the system stores role names and a user can alter them (via parameter tampering), they might gain elevated privileges.
+
+1.3 Attribute-Based Access Control (ABAC)
+Decisions based on subject, resource, action, environment attributes.
+
+Policy engines (e.g., Drools, OPA) evaluate rules.
+
+XACML reference architecture: PEP, PDP, PIP, PAP.
+
+Attack surface:
+
+Attribute spoofing – if attributes are taken from client-controlled inputs (headers, JWT claims, request parameters) without proper verification, an attacker can manipulate them. For example, changing timeOfDay attribute or IP address to bypass time/location restrictions.
+
+Rule injection – if policy rules are dynamically generated from user input (e.g., using Drools with templates that incorporate unsanitized values), an attacker could inject rule logic.
+
+Decision cache poisoning – if access decisions are cached based on attributes, an attacker might poison the cache by making a request with crafted attributes that result in a permit decision for a resource, then later reuse that cached decision for a different user/resource.
+
+Incomplete attribute collection – missing attributes can cause rules to default incorrectly. For example, if a rule checks action["method"] == "DELETE" but the action map is empty, the condition is false, and the rule doesn't fire – leading to an unintended permit.
+
+Policy misconfiguration – overly complex policies can have conflicting rules; unexpected default permit when it should be default deny. Testing for rule combinations and default behavior is crucial.
+
+PDP endpoint exposure – if the Policy Decision Point API is reachable without authentication, an attacker could query arbitrary decisions or even modify policies (if the PAP is not secured).
+
+PIP SSRF/Injection – if the Policy Information Point retrieves external attributes based on user-supplied URIs or identifiers, it could be used for SSRF or to return manipulated attributes.
+
+Time-based bypass – if the environment time is trusted from client or system clock can be manipulated, time-window restrictions can be bypassed.
+
+Expression injection – policy engines may use expression languages (MVEL, SpEL, etc.); if user input flows into the expression, it could lead to RCE or policy bypass.
+
+1.4 LDAP Integration (Groups)
+LDAP static groups (groupOfNames), dynamic groups (groupOfURLs), virtual static groups.
+
+Attack surface:
+
+LDAP injection in member lookup: (&(objectClass=groupOfNames)(member=uid=...)) – if username is not escaped, an attacker could close the filter and add )(cn=admin)).
+
+Attribute disclosure – the isMemberOf attribute might leak all groups a user belongs to if not properly filtered.
+
+Dynamic group abuse – if dynamic group URLs can be influenced, an attacker could redirect the LDAP server to an external LDAP directory under their control, causing membership in arbitrary groups.
+
+2. Bug Bounty Testing Methodology
+Step 1: Reconnaissance – Understand the Access Control Model
+Identify authorization mechanisms: look for role names, group names, permission strings in responses, JWT claims, cookies, or headers.
+
+Check if endpoints have annotations (@RolesAllowed) or explicit permission checks.
+
+Look for grouping features: Can a user create/manage groups? Can they assign users to groups?
+
+If ABAC, try to discover the policy engine by error messages, response times, or headers (X-Powered-By: Drools?).
+
+Step 2: Test Role/Group Manipulation
+Mass assignment: When adding a member or creating a resource, include extra parameters: "role":"admin", "groups":["admin"].
+
+Parameter pollution: Send multiple role parameters to see which one is taken.
+
+Invalid role names: Try roles like *, admin, superuser, root. Also try empty role, or very long strings (DoS).
+
+Change role after assignment: See if you can update your own role via PUT/PATCH to user profile or membership endpoint.
+
+Test default role: If the role parameter is omitted, does it default to a privileged role? Try sending no role at all.
+
+Check indirect role inheritance: If you are in a group, then change the group’s role, does your effective role change immediately or only after re-login? (May allow keeping old permissions.)
+
+Step 3: Abuse Role/Permission Lookup Logic
+Injection in group lookup: If the application uses LDAP or dynamic SQL, try injecting special characters: *, (, ), |, &. In LDAP, * matches all; try user*)(cn=*. In SQL, try ' OR '1'='1.
+
+Direct IDOR on roles/groups: If groups or roles have numeric IDs, iterate through them to find admin roles.
+
+Forced browsing of admin endpoints: Discover endpoints that lack the @RolesAllowed annotation but should be restricted. Use a fuzzer with common admin paths.
+
+Test negative scenarios: What if the user is deleted after role assignment? Or role is deleted? Might lead to a NULL role that grants full access due to a misconfiguration (e.g., missing check in requirePermission).
+
+Step 4: Attribute-Based Access Control Testing
+Spoof environment attributes: If attributes are taken from headers (e.g., X-Forwarded-For for IP), manipulate them. If time is involved, try setting a custom TimeOfDay header if the application uses that (unlikely, but worth checking).
+
+Examine JWT claims: If ABAC uses JWT claims for attributes, can you add or modify claims? In a signed JWT, no, but if the token is accepted without signature verification (e.g., alg:none attack), you can.
+
+Test rule injection: In systems like Drools where rules are loaded from files, check if there’s any user input that ends up in rule conditions. For example, if an admin console lets you define “time of day” restrictions via a text box, that might be compiled into rules, leading to code injection.
+
+Flood the PDP: Send many unique requests to see if decisions are cached improperly, then reuse a cached permit for a denied request.
+
+Check PDP authentication: If the PDP is a REST API, try calling it directly to get a permit decision. You might need valid attributes; you can craft them if you know the required format.
+
+Step 5: Common Misconfigurations Checklist
+Vulnerability	How to Test	Severity
+Missing @RolesAllowed on endpoint	Access restricted function without auth	High
+Role not validated on input	Add member with role=admin	Critical
+Default role is elevated	Omit role field when creating member	High
+Insecure direct object reference to roles	Change role_id parameter to admin’s ID	High
+LDAP injection in group filter	Input *)(cn=admin in username or group search	Critical
+ABAC attribute spoofing (IP, time)	Modify X-Forwarded-For or system clock	Medium-High
+Policy rule injection	Inject code into rule definition if editable	Critical
+PDP API without auth	Directly call PDP endpoint to get permit	High
+Cached decision reuse	After permitted request, replay with different resource attributes	Medium
+Insufficient group resolution frequency	Remove user from admin group, still access admin endpoints	Medium
+Step 6: Reporting
+When you find a bug, demonstrate with a clear PoC:
+
+Show how a normal user can add themselves to the admin group via parameter tampering.
+
+Show that by changing role from member to owner, you can delete other users’ messages.
+
+For injection, show a crafted LDAP filter that authenticates you as an existing admin.
+
+Always explain the business impact: privilege escalation, unauthorized data access, account takeover.
+
