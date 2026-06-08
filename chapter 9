@@ -1,0 +1,200 @@
+Chapter 9 – Capability-Based Security & Macaroons: A Bug Bounty Hunter’s Guide
+This chapter introduces a completely different approach to authorization: capabilities. Instead of checking “who you are”, the API checks “do you have the key?”. This shift eliminates entire classes of bugs (like CSRF, confused deputy) but introduces new ones. I’ll break down every concept and show you exactly what to test.
+
+1. Why Capabilities? The Confused Deputy Problem
+In identity-based access control (Chapter 8), a user’s permissions are attached to their session. The browser is a “deputy” that automatically sends those permissions (cookies) with every request. An attacker can trick the deputy into making a malicious request – that’s CSRF, the classic confused deputy.
+
+Capabilities solve this by removing ambient authority. A capability is an unforgeable reference that itself grants access, like a physical key. You can’t access a resource without possessing the corresponding capability. No more automatic cookie sending – you must explicitly present the capability with each request.
+
+Key difference for bug hunters: If you find a way to guess or steal a capability URI, you gain access. If you find a way to forge one, it’s game over.
+
+2. Capability URIs – The Tangible Attack Surface
+A capability URI combines the resource path and a secret token. For example:
+
+text
+https://api.example.com/spaces/1?access_token=KpLb8k...
+The token can be placed in different URI components, each with its own leakage risks.
+
+2.1 Token Placement & Leakage Vectors
+URI Part	Sent to Server?	In Referer Header?	In Logs?	Browser History?
+Path	Yes	Yes	Yes	Yes
+Query (?token=...)	Yes	Yes	Yes	Yes
+Fragment (#token=...)	No	No	No	Yes
+Userinfo (user:token@...)	Deprecated	No	No	Yes
+Attacks:
+
+Token in path/query → log leakage: If you can access server logs (e.g., via an SSRF or LFI), you can extract capability tokens.
+
+Referer leakage: If the API response contains links to external sites, or the user navigates away, the full URI (with token) may be sent in the Referer header. Test by looking at outgoing requests after accessing a capability URI.
+
+Browser history: If a user visits a capability URI directly, it’s stored in history. On a shared computer, an attacker can walk through history.
+
+2.2 Capability URI Creation in Natter
+The CapabilityController.createUri() method creates a token using the DatabaseTokenStore (a random string), stores the resource path and permissions in the token attributes, and appends it as ?access_token=.... The token has an expiry.
+
+Vulnerability: The token is stored in the database. If the database is compromised, all capabilities are exposed. Token hashing (Chapter 5) would help but isn’t shown here.
+
+2.3 Validating Capabilities
+When a request arrives, lookupPermissions checks:
+
+Extract access_token query parameter.
+
+Look up token in store.
+
+Check that token’s path attribute matches the request’s path exactly.
+
+Copy perms attribute to the request.
+
+Critical bug class – path confusion: The check uses Objects.equals(tokenPath, request.pathInfo()). If the token path is /spaces/1 but the request is for /spaces/1/messages, it fails. But what if the token path is /spaces/1/messages and the request is for /spaces/1/messages/../spaces/1? Path traversal tricks might bypass checks if not normalized. Test by using .., %2e%2e, double encoding.
+
+Another bug: If the access_token parameter is missing, permissions are not set → access denied (good). But what if the token is invalid? The tokenStore.read() returns Optional.empty(), and the code does nothing → permissions remain null → access denied. This seems safe. However, if an attacker can cause tokenStore.read() to throw an unhandled exception, the filter might fail open? Check error handling.
+
+3. HATEOAS – How Capabilities Propagate
+Since a capability is tied to a single resource, how do you access sub-resources? The server must return links (capability URIs) to those sub-resources in the response. This is HATEOAS.
+
+In Natter, after creating a space, the response includes separate capability URIs for:
+
+The space itself (rw perms)
+
+Messages with rw perms
+
+Messages with r perms only
+
+Attack: Permission escalation via link manipulation – If the client can modify the perms attribute in the returned link before using it, they could gain extra access. But since the token is cryptographically random (or HMACed), they cannot forge a new token with higher permissions. So direct manipulation fails. However, if the server trusts the perms query parameter from the request rather than the stored token, you could change permissions. In the Natter code, permissions come from the token store, not from the request. Good.
+
+Attack: Overly permissive links – The findMessages method (listing 9.7) creates read-only links for messages by copying the current request’s permissions but removing write. If the server inadvertently includes write permission for a read-only user, that’s a bug. Test by checking all returned links with different levels of access.
+
+4. Combining Capabilities with Identity
+The chapter later ties capability tokens to an authenticated user. This prevents a stolen token from being used by anyone else and removes the need for a separate anti-CSRF token (the capability acts as one).
+
+How: In createUri, the subject (authenticated user) is now stored in the token. In lookupPermissions, the token’s username must match request.attribute("subject"). If not, no permissions are set.
+
+Bug: User mismatch bypass – If an attacker can manipulate the subject attribute (e.g., by exploiting a session fixation or authentication bypass) to match the stolen token’s user, they can use it. Or if the token has a null user (from earlier versions), it might match any user. Test with old tokens that lack the user field.
+
+Bug: Capability sharing logic – The share endpoint allows a user to create a capability for another user, with potentially reduced permissions. It checks that the requested permissions are a subset of the original token’s permissions (tokenPerms.contains(perms)). What if the original token had "r" and you request "" (empty)? Empty string is always contained → maybe grants no permissions? Test boundary cases. Also, if the perms parameter is missing, it defaults to the full permissions of the original token (listing 9.11). That could be used to copy full access to another user, which might be intended but should be validated.
+
+5. Macaroons – Tokens with Caveats
+Macaroons are like HMAC-protected tokens, but with a twist: anyone can append caveats that further restrict the token. They are ideal for contextual restrictions (e.g., limit to a specific IP, time window, or HTTP method).
+
+5.1 How Macaroons Work (HMAC Chain)
+The server creates a macaroon with a random identifier and an HMAC tag computed with a secret key.
+
+Anyone can take that macaroon and add a caveat (like time < 2023-...). They compute a new HMAC using the previous tag as the key, then throw away the old tag.
+
+The caveat is appended, and the new tag becomes the final tag.
+
+To verify, the server recomputes the chain starting from the original key and identifier, then through each caveat, and checks that the final tag matches. Because HMAC is irreversible, removing a caveat is infeasible.
+
+Security property: You can only restrict, never expand. Caveats are purely subtractive.
+
+5.2 First-Party Caveats
+These are simple strings checked by the server at verification time. The API must have a verifier for each caveat type it supports.
+
+Common caveats:
+
+time < 2023-01-01T00:00:00Z (expiry)
+
+method = GET (read-only)
+
+since > 2019-10-12T12:00:00Z (custom)
+
+Attacks on first-party caveats:
+
+Missing verifier: If a caveat type is not registered in the verifier, the macaroon is rejected. But what if the API registers a generic verifier that always returns true? That would effectively disable that caveat type.
+
+Caveat injection/escaping: If the caveat string is constructed unsafely, an attacker might break the syntax. For example, if the method caveat is checked with satisfyExact("method = " + request.requestMethod()), what if the caveat is method = GET extra? The exact match would fail. But could you craft a caveat that the server misinterprets?
+
+Time-based bypass: The TimestampCaveatVerifier uses the server’s current time. If the server clock is wrong, or the attacker can manipulate it (e.g., via NTP spoofing), they might bypass time restrictions.
+
+Custom verifier bugs: The SinceVerifier (listing 9.17) checks if request.queryParams("since") is after the caveat’s time. If the request has no since parameter, it defaults to 1 day ago. This might allow reading older messages if no since is given. Test edge cases: if since parameter is malformed (not a valid date), it throws an exception, which might crash the verifier or bypass the check (if exception handling is poor).
+
+5.3 Third-Party Caveats
+These require the client to obtain a discharge macaroon from an external service. The caveat contains a secret key and an identifier. The third-party service uses the secret to mint a discharge macaroon that is cryptographically bound to the original.
+
+Attack surface:
+
+Discharge macaroon forgery: If the third-party service is compromised or the secret is weak/guessable, an attacker could forge a discharge token.
+
+Missing discharge binding: The API must verify that the discharge macaroon is properly bound. If the verification skips the binding step, any discharge token might be accepted.
+
+SSRF via location hint: The location hint in a third-party caveat tells the client where to go for discharge. If the API ever follows that hint (e.g., in some verification setups), an attacker could cause SSRF. In this chapter, the client contacts the third party, not the API. Still, if the API exposes an endpoint that proxies the discharge request, it could be abused.
+
+Identifier leakage: The caveat identifier is public. If it contains sensitive data, that’s a privacy issue.
+
+Testing: Since third-party caveats are rarely used outside specific ecosystems, you’re unlikely to encounter them. But if you do, check how the client obtains the discharge token. Is the secret in the caveat encrypted? If not, the client could extract it and create its own discharge token without contacting the real third party.
+
+5.4 Contextual Caveats
+A client can add caveats just before using a macaroon to limit its power in case of theft. For example, adding time < now+5 seconds before sending it over an untrusted channel.
+
+Bug opportunity: If the client app doesn’t add contextual caveats when it should (e.g., when performing a sensitive operation), the token travels with full power. While this isn’t a server bug, it could be a risk if you find a way to intercept tokens.
+
+6. Bug Bounty Testing Checklist for Capabilities & Macaroons
+Phase 1: Capability URI Leakage
+Check if tokens appear in URL path/query. Are they ever sent to external domains via redirects or embedded content? (Check Referer header)
+
+Look for tokens in browser history after navigating to capability URIs.
+
+Check if server logs (if accessible) contain tokens.
+
+Test WebSocket or EventSource connections – do they leak URIs?
+
+Phase 2: Token Forgery & Manipulation
+Attempt to modify the access_token parameter. Does changing one character still grant access? (Would indicate weak token generation or HMAC verification missing)
+
+If using JWTs as capability tokens, apply all JWT attacks (alg=none, key confusion, etc.)
+
+Try to use a token for a different resource (path confusion). Use .., URL encoding, extra slashes.
+
+Try to escalate permissions by changing the perms attribute in the token (if it’s a simple JSON token without integrity protection).
+
+Phase 3: HATEOAS Link Abuse
+Examine returned capability URIs for extra permissions. For a read-only user, do any links grant write access?
+
+Try to tamper with the perms query parameter in returned links before calling them. (Should be ignored if token is authoritative, but test anyway.)
+
+If the server returns a link with a longer expiry than expected, can you use it to extend access?
+
+Phase 4: Identity Binding Bypass
+Obtain a capability URI while authenticated as user A. Log out, then log in as user B. Try to use user A’s capability URI. It should fail (if bound). If it works, identity binding is missing.
+
+If identity binding is present, try to forge the subject attribute via any authentication bypass to match the token’s user.
+
+Phase 5: Sharing Endpoint Abuse
+Call the /capabilities share endpoint with a token you own. Request a higher permission than the original token has. Should be denied.
+
+Request an empty permissions string. What happens?
+
+Request a token for another user with full permissions. Is that allowed?
+
+If the endpoint does not verify the original token’s path, can you exchange a token for a different resource?
+
+Phase 6: Macaroon Caveats
+Obtain a macaroon. Append a caveat that the server doesn’t understand (e.g., foo = bar). The macaroon should be rejected. If accepted, the server is not enforcing strict caveat checking – potential for abuse.
+
+Try to add a caveat that looks like a valid one but with extra characters (e.g., time < 2023-01-01T00:00:00Z extra). If the verifier does exact matching, it might not match and the caveat is ignored? But the verifier should reject unknown caveats.
+
+Add an expiry caveat that is in the past. The macaroon should be immediately invalid.
+
+Add a method caveat method = POST and use it with a GET request. Should be rejected.
+
+For custom caveats like since, test edge cases: missing since query parameter, invalid date format, dates far in the future.
+
+If you can remove a caveat from the serialized macaroon string (e.g., by editing the Base64), the HMAC chain will break and the token should be rejected. Verify this behavior.
+
+Phase 7: Discharge Macaroons (if present)
+If a third-party caveat is used, obtain the discharge macaroon. Try to reuse it with a different original macaroon. It should fail due to binding.
+
+Try to craft a discharge macaroon by guessing the secret or using a known key.
+
+Check the third-party service for SSRF or other abuses if the client follows the location hint.
+
+7. Summary of Key Vulnerabilities
+Vulnerability	How to Test	Severity
+Capability token in plaintext (path/query)	Check logs, history, Referer	High
+Missing path validation (path traversal)	Try to use token on sibling paths with ..	Critical
+Insufficient token entropy	Analyze tokens for patterns, brute-force	Critical
+Missing user binding on capability	Use another user’s session with stolen token	High
+Share endpoint privilege escalation	Request wider permissions than original	Critical
+Macaroon caveat bypass (missing verifier)	Add unknown caveat, see if accepted	Medium
+Custom caveat logic bugs	Test edge cases (empty, malformed, extreme values)	Medium-High
+Discharge macaroon reuse/binding flaw	Use discharge token with different primary
