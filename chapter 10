@@ -1,0 +1,196 @@
+Chapter 10 – Microservice APIs in Kubernetes: A Bug Bounty Hunter’s Guide
+This chapter takes your API security testing into a modern microservice architecture running on Kubernetes. It covers container hardening, service mesh, network policies, and the new attack surface introduced by inter‑service communication. Your goal: find and exploit misconfigurations in Docker containers, Kubernetes deployments, and the service mesh, then escalate laterally within the cluster.
+
+I’ll break down every concept into actionable tests, showing you exactly what to probe and how to exploit it.
+
+1. Reconnaissance – Is the Target Running on Kubernetes?
+Before diving into specific attacks, determine if the API is hosted on Kubernetes. Look for:
+
+Response headers like X-Kubernetes-Pod-Name, X-Kubernetes-Namespace, Server: nginx/1.21 (common for ingress).
+
+Error pages that reveal NGINX (the default ingress controller) or Kubernetes service names.
+
+Endpoint patterns such as /api/v1/..., /metrics, /healthz, or /readyz (if exposed).
+
+Open ports: Kubernetes API server (often 6443 or 443), kubelet (10250, 10255), etcd (2379). Use Shodan/Censys to find exposed services.
+
+TLS certificate Subject Alternative Names (SANs) that might include *.cluster.local or internal service names.
+
+Once confirmed, note the namespace(s), service names, and any exposed ingress controllers.
+
+2. Container Escapes & Pod Privilege Escalation
+If you compromise a pod (e.g., via an SSRF that gives you command execution), you need to test whether you can break out to the node.
+
+2.1 Check Your Current Privileges
+Inside the container, run:
+
+bash
+id                # if uid=0(root) you already have high privileges
+capsh --print     # list Linux capabilities
+mount             # look for docker.sock, hostPath volumes
+env               # check for credentials, service account tokens
+2.2 Exploit Dangerous Mounts
+Docker socket (/var/run/docker.sock): You can run containers on the host and escape.
+
+bash
+docker -H unix:///var/run/docker.sock run -it --privileged --pid=host alpine nsenter -t 1 -m -u -i sh
+hostPath writeable mounts: If you can write to a path like /host, you can create a setuid binary, crontab entry, or modify Kubernetes manifests.
+
+Service account token mounted at /var/run/secrets/kubernetes.io/serviceaccount/token – use it to talk to the Kubernetes API. Try kubectl with that token or curl the API server.
+
+2.3 Abuse Privileged Containers
+If the pod is running privileged (all capabilities) or with specific dangerous capabilities (like SYS_ADMIN, NET_RAW), you might be able to:
+
+Load kernel modules.
+
+Change network configuration.
+
+Use nsenter to enter host namespaces.
+
+Always try to read /proc/1/cgroup to check if you’re in a container and the container runtime (docker, containerd). Then use known container escape techniques (CVE-2019-5736, CVE-2022-0185, etc.).
+
+3. Attacking the Service Mesh (Linkerd / Istio)
+The chapter introduces Linkerd to automatically apply mTLS between services. If the mesh is misconfigured, you can bypass the encryption or impersonate services.
+
+3.1 Check for mTLS Downgrade
+If the mesh is in permissive mode, it accepts both plain HTTP and mTLS. Try sending plain HTTP to a service that should require mTLS; if it works, you can eavesdrop or inject traffic.
+
+Use linkerd tap (if you have access) to see if traffic is encrypted (tls=true). Or from within a compromised pod, run tcpdump to inspect traffic. Unencrypted traffic between pods is a high‑risk finding.
+
+3.2 Certificate Validation Bypass
+If you can get hold of the mesh’s root CA certificate (often stored in a ConfigMap or secret), you can generate your own client certificate and impersonate any service. Look for the CA certificate in linkerd namespace.
+
+Test if the server verifies the client certificate SAN against the service identity. If not, any valid certificate from the mesh CA can be used to access any service.
+
+3.3 Bypass the Sidecar Proxy
+In some deployments, the sidecar proxy can be bypassed if the application listens on a different network interface or if iptables rules are not correctly redirecting all traffic. Try to connect directly to the application’s actual IP/port (bypassing the proxy) from another pod. If it works, you can skip mTLS entirely.
+
+4. SSRF Attacks – The Link‑Preview Service
+The LinkPreviewer microservice fetches URLs from user‑supplied links. This is the classic SSRF target. The chapter adds validation to prevent private IP access, but you can attempt to bypass it.
+
+4.1 Basic SSRF Test
+Send a message containing a URL like:
+
+text
+http://169.254.169.254/latest/meta-data/
+http://metadata.google.internal
+http://kubernetes.default.svc.cluster.local
+http://natter-database-service.natter-api:9092
+If the service follows the URL and returns content (maybe in a debug response), it’s vulnerable.
+
+4.2 Bypassing IP Blacklists
+The code in LinkPreviewer.isBlockedAddress() checks for loopback, link-local, site-local, multicast, and unique local addresses. Possible bypasses:
+
+Use a domain that resolves to a private IP (DNS rebinding). Set up a domain with a very short TTL. First, configure it to resolve to a public IP (to pass validation). After the first DNS lookup, quickly change it to 127.0.0.1 or an internal IP. The second DNS lookup (during the actual fetch) will get the internal IP. This is exactly the DNS rebinding attack described in section 10.2.8.
+
+URL obfuscation: Use decimal/octal/hexadecimal encoding of IP addresses, e.g., http://2130706433/ for 127.0.0.1, http://0x7f000001/, http://0177.0.0.1/.
+
+IPv6 variations: http://[::1]/, http://[0:0:0:0:0:ffff:127.0.0.1]/.
+
+Redirect bypass: Even though the code follows redirects and checks each URL, if the redirect is to an external IP that then redirects to internal, it still passes validation? Actually, the code fetches each redirect URL and checks that the IP is not blocked. But if the attacker’s server initially returns a 302 to another external URL that then returns 302 to internal, the second redirect URL (external) will pass validation. Then the final fetch of the internal URL will be done by jsoup? Wait, the code in fetch() (listing 10.16) loops: it checks the new URL from the Location header, sets url to that, and goes back to the start. So it validates every redirect individually. However, if the redirect chain includes a URL that resolves to a public IP but the server’s DNS for that domain changes between validation and actual fetch (Time of Check Time of Use), you can still use DNS rebinding. The validation uses isBlockedAddress(url) which does InetAddress.getAllByName(host). If at the time of that call the IP is public, it passes. Then later Jsoup.connect(url).execute() does another DNS lookup; if the IP has changed to private, it will connect to internal. This is the core of the attack.
+
+Use alternative protocols that might not be blocked: file:///etc/passwd, gopher://..., dict://.... Jsoup only allows HTTP/HTTPS by default, but if you can control the library or there’s another service that uses a less strict URL fetcher, test these.
+
+4.3 Blind SSRF & Side Effects
+Even if the response is not returned, you can still exploit SSRF:
+
+Port scan internal services by measuring response times or error messages.
+
+Perform GET-based attacks on internal HTTP APIs (e.g., /api/admin/delete?user=all).
+
+Access cloud metadata services to steal IAM credentials (AWS, GCP, Azure).
+
+5. Network Policies & Lateral Movement
+Once inside a pod, you can scan the internal network. The chapter mentions that by default, there are no network restrictions in Minikube, allowing full lateral movement.
+
+5.1 Map the Internal Network
+From a compromised pod:
+
+bash
+# Install basic tools (if you can write to /tmp)
+apt-get update && apt-get install -y nmap curl
+# Or use built-in bash /dev/tcp
+for ip in $(seq 1 254); do (echo >/dev/tcp/10.0.0.$ip/9092) 2>/dev/null && echo "10.0.0.$ip up"; done
+Look for Kubernetes services using DNS:
+
+bash
+nslookup natter-database-service.natter-api.svc.cluster.local
+curl http://natter-database-service:9092/...
+The H2 database (port 9092) might be unprotected if you haven’t applied network policies. Try to connect using the JDBC URL with guessed credentials (maybe default sa/).
+
+5.2 Access Other Namespaces
+If no network policies are in place, you can reach services in other namespaces. Try to access kube-system, istio-system, linkerd etc. to find control plane components.
+
+5.3 Test Network Policy Enforcement
+If network policies are advertised, attempt to violate them:
+
+From a pod labeled app=not-allowed, try to connect to a database pod. If the policy is properly enforced, the connection should be blocked. If it succeeds, the policy is misconfigured or not applied.
+
+6. Ingress Controller Attacks
+The ingress controller is the entry point for external traffic. It’s a reverse proxy (NGINX in the example). Misconfigurations here can lead to access to internal services, TLS bypass, or header injection.
+
+6.1 Host Header Injection
+The ingress routes requests based on the Host header. Try:
+
+text
+GET / HTTP/1.1
+Host: internal-service.natter-api.svc.cluster.local
+If the ingress forwards the request to that internal service without proper validation, you may access otherwise private APIs.
+
+6.2 Path Traversal / Bypass Routing
+The ingress config (listing 10.20) sends all traffic to natter-api-service. But if multiple backends are defined, try path traversal:
+
+text
+/api/../../../internal-service/private
+Many NGINX ingress controllers are vulnerable to off-by-slash path confusion.
+
+6.3 TLS Termination & Backend Plain HTTP
+Even if external traffic uses HTTPS, the ingress may talk plain HTTP to the backend. If you can compromise any pod, you can sniff that traffic (unless mTLS is enabled). In the chapter, Linkerd upgrades the internal connection to mTLS, but if the service mesh is not installed, traffic is plaintext.
+
+6.4 NGINX‑Specific Misconfigurations
+proxy_pass without trailing slash can lead to path traversal: proxy_pass http://backend vs proxy_pass http://backend/ (the latter replaces the matched prefix).
+
+Check merge_slashes setting for double‑slash bypass.
+
+Try HTTP request smuggling by sending Transfer-Encoding: chunked and Content-Length headers with conflicting sizes.
+
+7. Secrets Exposure & Kubernetes API Abuse
+7.1 Service Account Tokens
+Every pod has a service account token mounted at /var/run/secrets/kubernetes.io/serviceaccount/token. Grab it and use it to query the Kubernetes API:
+
+bash
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+APISERVER=https://kubernetes.default.svc
+curl -k -H "Authorization: Bearer $TOKEN" $APISERVER/api/v1/namespaces/natter-api/secrets
+If the service account has excessive RBAC permissions, you can list all secrets, create pods, or even get a shell on other containers.
+
+7.2 Secrets in Environment Variables
+The chapter creates a Kubernetes secret natter-tls for the TLS certificate. If a pod mounts it as an environment variable (not recommended), you can read it. More commonly, secrets are mounted as files. Look for db-password, api-keys, jwt-signing-key in /etc/ or /var/run/secrets/.
+
+7.3 Etcd Exposure (Rare)
+If etcd (port 2379) is exposed without authentication, you can extract all secrets, including those used for service mesh certificates. That’s game over for the cluster.
+
+8. Docker Image Vulnerabilities & Supply Chain
+The chapter builds minimal container images (distroless) which reduce attack surface. However, in real‑world apps, you might find:
+
+Base images with known vulnerabilities (use trivy, grype on exposed images).
+
+Images that contain sensitive files: .git, SSH keys, cloud credentials, private keys.
+
+Images running as root with unnecessary capabilities.
+
+If you can get the Dockerfile or image layers, review them for security misses.
+
+Quick‑Reference Testing Checklist
+Attack Vector	Test / Payload	Expected Result
+SSRF via link‑preview	Submit URL http://169.254.169.254/	Get AWS metadata if not blocked
+DNS rebinding bypass	Set up domain with TTL=0, flip IP after validation	Access internal service
+Redirect chain SSRF	Use URL that redirects (302) to internal IP	Internal fetch succeeds
+Host header injection	curl -H "Host: internal.svc.cluster.local" ingress-ip	Access internal service
+Path traversal on ingress	curl https://api/../other-service/secret	Access other service
+Missing mTLS (permissive)	From pod, curl http://other-service:port (plain HTTP)	Connection accepted
+Network policy bypass	From non‑allowed pod, connect to DB port	Connection allowed (misconfig)
+Privileged container escape	capsh --print, check for SYS_ADMIN	Escape to node
+Docker socket abuse	docker -H unix:///var/run/docker.sock ps	Host compromise
+Secrets enumeration via API	Use pod’s service account token to list secrets	Leakage of credentials
+Etcd unauthenticated access	curl http://etcd:2379/v2/keys	Leak cluster secrets
