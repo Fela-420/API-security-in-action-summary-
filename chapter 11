@@ -1,0 +1,170 @@
+Chapter 11 – Service-to-Service API Security: A Bug Bounty Hunter’s Guide
+This chapter covers how services authenticate to each other without a user. This is common in microservices, cloud APIs, and B2B integrations. Misconfigurations here can lead to full API access, privilege escalation, or lateral movement—often with higher privileges than a normal user account. Let’s break down what to test and how to exploit it.
+
+1. Reconnaissance: Identifying Service Auth Mechanisms
+Before attacking, determine how the service authenticates. Look for:
+
+API keys in headers or query parameters: X-API-Key, api_key, Authorization: Bearer <key>
+
+OAuth2 client credentials: token endpoint responses containing grant_type=client_credentials or client_id/client_secret parameters
+
+JWT bearer assertions: look for urn:ietf:params:oauth:client-assertion-type:jwt-bearer or client_assertion in token requests
+
+Mutual TLS (mTLS): presence of client certificate request during TLS handshake; check if server requires a certificate
+
+Service accounts: might use grant_type=password (ROPC) with a non-human username
+
+Token exchange: if you see grant_type=urn:ietf:params:oauth:grant-type:token-exchange in the token endpoint, it's being used.
+
+Tip: If you can register your own service/client, do so. This allows you to test with legitimate credentials and observe the format.
+
+2. API Key / JWT Bearer Vulnerabilities
+2.1 Predictable or Weak API Keys
+Pattern analysis: Collect multiple API keys. If they are short, sequential, or based on timestamp/username, you might forge them.
+
+Brute-force: if the key is short or low entropy, try common patterns.
+
+Exposure: Check if the key is sent in URL parameters (leaks in logs, Referer). Search in JavaScript files, mobile apps, public code repositories (Shodan, GitHub dorking).
+
+2.2 JWT Bearer Key Confusion
+If the API key is a JWT signed with a public-key algorithm:
+
+Test the classic alg:none attack (remove signature).
+
+Try to change the algorithm to HS256 and sign with the public key (key confusion). Many JWT libraries don't lock the algorithm.
+
+Check if the kid header can be used for path traversal or SQLi to fetch a different key.
+
+Look for JWK Set URI (jku) that can be replaced with your own.
+
+2.3 Missing Expiry / Revocation
+API keys often have long lifetimes. If you obtain a key from a former employee or leaked source, it might still work.
+
+If there is no mechanism to revoke keys (no introspection/revocation endpoint), report this as a risk.
+
+3. OAuth2 Client Credentials Grant Attacks
+The client_credentials grant is used for service-to-service calls. Test the token endpoint:
+
+3.1 Weak Client Authentication
+Try authenticating without a secret (if public client allowed).
+
+Brute-force the client_secret (often a simple string, not a strong random).
+
+If the secret is sent in the body as client_secret parameter (not Basic auth), it might be logged.
+
+If the AS supports client_secret_basic, test for missing URL-encoding issues.
+
+3.2 Scope Escalation
+Request an access token with a different (broader) scope than what the client is authorized to. If the AS ignores the scope parameter or allows partial elevation, you gain extra permissions.
+
+Test scope parameter with extra characters, duplication, or whitespace: scope=read%20write vs scope=read and then scope=write etc.
+
+3.3 Client ID Enumeration
+The token endpoint might leak whether a client ID exists through error messages or response times. Use this to discover valid clients.
+
+4. Service Account Authentication (ROPC + JWT Bearer)
+Service accounts often have elevated privileges. If you can authenticate as one, it's critical.
+
+4.1 Resource Owner Password Credentials (ROPC)
+If the token endpoint allows grant_type=password, try to brute-force service account credentials (often simple or default passwords like serviceA:password).
+
+Check if service account usernames follow a pattern (e.g., svc-, sa-). Enumerate them.
+
+4.2 JWT Bearer Grant for Service Accounts
+If the AS accepts urn:ietf:params:oauth:grant-type:jwt-bearer, look for:
+
+Weak signing keys: If you can access the private key (e.g., from a leaked keystore, misconfigured endpoint), you can sign a JWT for any service account.
+
+Missing issuer validation: The AS might not check the iss claim against a trusted list. You could sign a JWT with your own key and claim to be a service account from a different issuer.
+
+audience validation: Check if the AS validates the aud claim. If not, you might replay a JWT issued for a different AS or endpoint.
+
+JWT replay: Even with a short exp, if the AS doesn't track used jti values, you can reuse a captured assertion. Use a stolen JWT quickly.
+
+Practical test: If you can register a client, obtain a JWT assertion for your own service account, then modify the sub to another account and see if it works. Or, replay the same assertion multiple times.
+
+5. Mutual TLS (mTLS) Attacks
+5.1 Client Certificate Bypass
+Test if the server requests but doesn't require a client certificate (optional mode). You may be able to connect without one and still access the API.
+
+If the server requires a certificate, try to present a self-signed certificate. If the server only checks that a certificate exists but doesn't validate the chain, you can bypass.
+
+Check if the ssl-client-verify header is trusted from the ingress (if the API relies on it). If you can directly connect to the backend (bypassing the ingress), you might set this header yourself. Test with internal network access.
+
+5.2 Certificate Confusion (Subject DN vs. SAN)
+The code in the chapter uses SAN (DNS type) to extract the username. If the server uses Subject DN, you can create a certificate with a DN that matches a privileged user (e.g., CN=admin). Many CAs don't restrict the DN.
+
+Test with different SAN types (URI, email). The code only checks DNS type 2; if the server accepts a certificate with a URI SAN, it might bypass.
+
+5.3 Certificate Thumbprint Mismatch (Certificate-Bound Tokens)
+If the access token is certificate-bound (has cnf claim), you need the private key to use it. But:
+
+Check if the cnf validation is enforced. Try to use the token without a client certificate—does it still work?
+
+If the token introspection response contains cnf.x5t#S256, compute the hash of your own certificate, then craft a request with that certificate but use the stolen token. Does the API compare the hash correctly? (It should reject because the hash won't match.)
+
+If the API just checks that cnf is present but doesn't verify the hash, you can use any certificate.
+
+The cnf claim might contain other confirmation methods (e.g., jkt). If the API doesn't understand them and skips validation, you can bypass.
+
+Code flaw: In listing 11.10, the API rejects unknown confirmation methods. But some implementations might ignore them, allowing an attacker to strip the cnf entirely.
+
+6. Key and Secret Management Weaknesses
+6.1 Kubernetes Secrets Exposure
+If you gain command execution in a pod (e.g., via SSRF or RCE), check for mounted secrets:
+
+bash
+mount | grep secret
+ls /etc/secrets/
+cat /etc/secrets/database/password
+Check environment variables: printenv | grep -i secret
+
+If you have access to the Kubernetes API (using the pod's service account token), list secrets:
+
+bash
+curl -k -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
+  https://kubernetes.default.svc/api/v1/namespaces/natter-api/secrets
+If the service account has get/list permissions on secrets, you can extract all of them.
+
+6.2 Hardcoded Credentials in Source Code/Config
+Search the application's environment, filesystem, or source code for API keys, client secrets, database passwords, or private keys.
+
+Look for keystore files (.p12, .jks) and attempt to crack them with weak passwords (like changeit).
+
+6.3 Weak Key Derivation
+If the service uses HKDF to derive keys from a master secret, and you obtain that master secret, you can derive all other keys. The master key might be stored in a Kubernetes secret or in a file. Find it.
+
+6.4 Short-Lived Token Reuse
+Some systems deploy short-lived JWTs to pods. If you can intercept that JWT before the pod uses it, you can use it to obtain your own access token (since they are one-time use in some designs). The window is small but possible in race conditions.
+
+7. Token Exchange & Phantom Token Attacks
+7.1 Impersonation via Token Exchange
+If the token exchange endpoint (grant_type=urn:ietf:params:oauth:grant-type:token-exchange) is accessible, try to exchange a user's token for a token with higher privileges. Manipulate the scope, audience, or resource parameters.
+
+The actor_token parameter might be used to impersonate a service. If you can supply your own actor token (or none), you might become the actor.
+
+Check if the exchanged token retains the original sub but adds an act claim. If a backend service trusts only the act claim and not the sub, you can impersonate any user by acting as a trusted service.
+
+7.2 Phantom Token Forgery
+In the phantom token pattern, the gateway replaces the opaque token with a short-lived signed JWT. If you can obtain that signing key (from a microservice or misconfigured endpoint), you can forge arbitrary JWT claims, including sub and scope.
+
+Check if the JWT includes a kid that points to a URL; you might be able to conduct a jku attack.
+
+If the JWT is not encrypted, you can decode it and look for sensitive info (e.g., internal user IDs).
+
+8. Quick Testing Checklist
+Attack Vector	How to Test	Severity
+Predictable API key	Analyze keys; brute-force if short/pattern	High
+JWT alg:none	Remove signature, set alg:none	Critical
+Key confusion (RS256→HS256)	Sign with public key	Critical
+Missing JWT audience/issuer	Modify aud/iss to target different service	High
+Client secret brute-force	Try common/weak secrets on token endpoint	High
+Scope escalation in client credentials	Request broader scope than authorized	High
+ROPC for service accounts	Try default passwords, brute-force	Critical
+JWT bearer replay	Reuse same assertion before expiry	High
+mTLS not enforced	Connect without certificate; check ssl-client-verify bypass	High
+Certificate-bound token bypass	Use token without certificate; tamper cnf claim	High
+Kubernetes secret enumeration	Use pod's service account to list secrets	Critical
+Hardcoded credentials	Search filesystem, env vars, source	High
+Phantom token forgery	Steal signing key, forge JWT	Critical
+Token exchange abuse	Manipulate subject_token, scope, actor_token	High
