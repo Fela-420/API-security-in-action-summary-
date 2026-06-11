@@ -1,0 +1,158 @@
+Chapter 12 – Securing IoT Communications: A Bug Hunter’s Deep Dive
+This chapter shifts the focus from traditional web APIs to the Internet of Things (IoT), where devices are often constrained in CPU, memory, and power. These limitations force us to use different protocols (UDP, DTLS), compact cryptographic primitives, and alternate key management. For a bug bounty hunter, this means new attack surfaces: nonce reuse, weak cipher suites, missing forward secrecy, PSK mismanagement, and end‑to‑end encryption gaps.
+
+I’ll break down every concept, highlight what can go wrong, and show you how to test for vulnerabilities in real‑world IoT deployments.
+
+1. Why IoT Security Is Different (and What to Attack)
+In web APIs, you assume a robust TLS stack, strong algorithms, and a solid PKI. In IoT:
+
+Constrained devices may not handle RSA/ECC handshakes efficiently, so they often use pre‑shared keys (PSK) or weaker cipher suites like AES‑CCM.
+
+UDP replaces TCP; security is provided by DTLS (Datagram TLS), which has its own quirks (e.g., no built‑in replay protection unless sequence numbers are managed).
+
+End‑to‑end security might be needed because messages traverse multiple protocols (BLE → MQTT → HTTP). If not done correctly, intermediate gateways can read or tamper with plaintext.
+
+Nonce reuse is a massive risk because many IoT chips lack good entropy sources; reusing a nonce with AES‑GCM or ChaCha20‑Poly1305 can completely break confidentiality and authenticity.
+
+Your mission: Find where developers cut corners on crypto, reuse nonces, skip forward secrecy, or misconfigure PSK identities.
+
+2. Datagram TLS (DTLS) – The New Transport Security
+DTLS is TLS over UDP. It works similarly but has to handle packet loss, reordering, and replay. In Java, you use the low‑level SSLEngine class, manually driving the handshake with wrap() / unwrap() calls.
+
+2.1 Handshake State Machine
+The SSLEngine reports statuses like NEED_UNWRAP, NEED_WRAP, NEED_TASK. Misunderstanding this can cause:
+
+Incomplete handshakes → connection hangs or fallback to plaintext.
+
+Skipping NEED_TASK (expensive crypto operations) could force the engine to block.
+
+Bug bounty angle: If a server implementation incorrectly handles these states, it might accept unencrypted data before the handshake finishes. Look for services that respond to unauthenticated packets during handshake.
+
+2.2 Cipher Suites for Constrained Devices
+The chapter discusses why the usual web‑recommended suites (ECDHE‑RSA‑AES256‑GCM‑SHA384) are too heavy for IoT. Alternatives:
+
+AES‑CCM – uses only AES encryption circuit, compact, but has a design flaw: CCM requires a unique nonce for each message, which is hard to guarantee in DTLS.
+
+ChaCha20‑Poly1305 – software‑friendly, good on ARM, but also sensitive to nonce reuse.
+
+PSK cipher suites (see section 3) – drop public‑key crypto entirely.
+
+Vulnerabilities to test:
+
+Weak cipher suite enabled: The server might allow TLS_PSK_WITH_AES_128_CBC_SHA or even NULL ciphers. Use sslscan or nmap --script ssl-enum-ciphers (against DTLS) to list supported suites. Look for RC4, DES, export ciphers, or anonymous key exchange.
+
+Nonce reuse in AES‑GCM/CCM: If the device uses random nonces, check that they are long enough (≥ 12 bytes for GCM). If you can capture two DTLS records encrypted with the same key and nonce, you can forge or decrypt data. This is a known attack on GCM – https://github.com/nonce-disrespect/nonce-disrespect. In a bug bounty, try replaying the same record multiple times; if the server processes it, that’s a replay attack. If you can inject a packet with a known nonce, maybe you can cause reuse.
+
+Missing forward secrecy: Older PSK suites or static RSA/ECDH key exchanges don’t provide forward secrecy. If the long‑term key is later compromised, all past traffic can be decrypted. This might be an accepted risk but report if sensitive data is long‑lived.
+
+3. Pre‑Shared Keys (PSK) – Authentication Without Certificates
+PSK replaces certificate chains with a shared symmetric key. It’s extremely lightweight but brings its own challenges.
+
+3.1 Raw PSK vs PSK with Forward Secrecy
+Raw PSK (e.g., TLS_PSK_WITH_AES_128_CCM): No forward secrecy. An attacker who obtains the PSK can decrypt every past session.
+
+PSK with ECDHE/DHE (e.g., TLS_ECDHE_PSK_WITH_AES_128_CCM_SHA256): Uses ephemeral Diffie‑Hellman to provide forward secrecy. Requires the device to perform ECDH, which may not be feasible.
+
+Testing:
+
+PSK identity enumeration: The client sends a PSK identity (often a hash or serial). If the server responds with a “PSK identity not found” error, you can brute‑force identities. Some implementations use predictable IDs (e.g., device-001).
+
+PSK hint leakage: The server can send a hint to help the client choose the right PSK. If the hint reveals sensitive info (e.g., "Corporate WiFi PSK"), that’s a low‑severity info leak.
+
+Weak PSK derivation: If the PSK is derived from a master key using a weak method (e.g., MD5(serial)), you might guess or brute‑force it. The chapter suggests using HKDF with a random per‑device component, but in practice many use sha256("secret" + mac_address).
+
+3.2 Bouncy Castle Implementation
+The code examples show how to set up a PSK server/client using Bouncy Castle. To test, you can write a custom DTLS client that tries different identities or PSKs.
+
+Attack scenario: If the server accepts any PSK (the identity manager always returns the same key), then anyone with the PSK can connect. This is by design for internal networks, but if the PSK is hard‑coded in firmware and extracted by an attacker, all devices are compromised.
+
+4. End‑to‑End Security – Protecting Messages Across Hops
+In IoT, a message may go from sensor → BLE gateway → MQTT broker → cloud API. If only hop‑by‑hop TLS is used, the gateway/broker sees plaintext. End‑to‑end encryption ensures only the sender and final receiver can read it.
+
+4.1 COSE (CBOR Object Signing and Encryption)
+COSE is the binary sibling of JOSE, designed for CBOR. It supports:
+
+AES‑CCM, ChaCha20‑Poly1305 (authenticated encryption)
+
+HKDF with per‑message key derivation to avoid nonce reuse.
+
+ECDH‑SS (static‑static Diffie‑Hellman) for both encryption and sender authentication.
+
+Vulnerabilities:
+
+Nonce misuse: COSE’s A128GCM, A256GCM are still vulnerable to nonce reuse. Even with HKDF, if the base key and the nonce in PartyU nonce are reused, you can break it.
+
+Missing context binding: The HKDF context fields (PartyU/V identity, other) should be used to bind the derived key to the exact usage. If they’re omitted or set to constant values, the same key may be derived for different messages. An attacker could replay an encrypted message to a different endpoint if the context is not validated.
+
+Weak algorithms: COSE supports many deprecated/weak algorithms, like RSA1_5 (PKCS#1 v1.5) for key encryption. An API that accepts such tokens is vulnerable to Bleichenbacher’s attack. Always check which algorithms the server accepts; if it trusts the alg parameter from an unprotected header, you can downgrade.
+
+4.2 NaCl / libsodium – Simplicity Wins
+Many IoT projects use NaCl (or libsodium) for its misuse‑resistant design. Its SecretBox uses XSalsa20‑Poly1305 with a 192‑bit nonce, making random generation safe even on constrained devices.
+
+Testing NaCl:
+
+Nonce size: Ensure the implementation uses 24‑byte nonces. If they truncate to 12 bytes, collision probability rises.
+
+CryptoBox (public‑key): Relies on static ECDH, so no forward secrecy. If long‑term keys are leaked, all past messages can be decrypted. Also, there’s no built‑in replay protection; you must add a sequence number.
+
+Missing authentication: NaCl’s crypto box authenticates the ciphertext, but it does not bind the key to any context. An attacker could take an encrypted message from Alice to Bob and send it to Bob’s other service if the same keypair is reused. Ensure that each message includes sender/receiver identities and a timestamp/nonce inside the plaintext.
+
+4.3 Misuse‑Resistant AEAD (SIV‑AES)
+SIV‑AES is designed to survive nonce reuse gracefully. Even if you reuse the same nonce (or if the nonce is derived from the plaintext itself), it only leaks whether the same plaintext was encrypted twice.
+
+Attack scenario: In a bug bounty, you might find a device that uses a weak random number generator, causing occasional nonce repeats. If it uses GCM, you could recover the authentication key and forge messages. If it uses SIV, the damage is limited. This is a defense‑in‑depth mechanism, not a vulnerability per se, but if the device claims “nonce misuse resistant” and actually uses GCM, that’s a design flaw.
+
+5. Key Distribution and Management
+How do you get the secret key onto every device and keep it safe?
+
+5.1 One‑Off Provisioning
+Keys burned into ROM at the factory. If the factory is compromised or an attacker can read the firmware, they can extract the key. Many IoT devices lack secure storage (no TPM/secure element). Firmware extraction via JTAG or UART is a common attack.
+
+Testing: If you can obtain a device, attempt to dump firmware. Look for strings that look like keys. If the key is derivable from device info (serial, MAC), you can impersonate any device.
+
+5.2 Key Distribution Servers
+Devices enroll with a server and receive temporary keys. The initial enrollment key might be the only one burned in. If that enrollment key is weak or the enrollment protocol has no mutual authentication, an attacker could inject fake devices or intercept keys.
+
+Attack: Man‑in‑the‑middle the enrollment if it uses PSK without perfect forward secrecy (or if the server’s certificate is not validated). Replay enrollment messages to get multiple devices to use the same key.
+
+5.3 Ratcheting for Forward Secrecy
+By periodically updating keys using a one‑way function, you ensure that compromise of current key doesn’t reveal past keys. However, it does not prevent future compromise; if the attacker steals the current key, they can compute all future keys. This is why ratcheting is often combined with fresh Diffie‑Hellman to regain post‑compromise security.
+
+Testing: Check if the ratcheting interval is too long, leaving a large window of past messages decryptable if a key is leaked. Also, verify that the old key is properly zeroized; memory corruption bugs might leave key material in RAM.
+
+5.4 Post‑Compromise Security
+Hardware‑backed security (TPM, TEE) can protect keys even after a compromise. Without hardware, if a device is compromised, you may need to re‑provision it. Accepting that a device can be permanently owned is a risk assessment.
+
+Bug angle: If a device claims “secure boot” or “hardware isolation” but you can bypass it (e.g., via a known CVE on the secure element), that’s a critical vulnerability.
+
+6. Quick IoT Security Testing Checklist
+Category	What to Test	Tools / Methods
+Transport	- Supported DTLS versions and ciphers
+- Anonymous/weak ciphers enabled
+- Certificate validation (if used)
+- Replay attack (duplicate DTLS records)	sslscan, nmap --script ssl-enum-ciphers -sU -p 5683 (CoAPs), custom scripts
+PSK	- PSK identity enumeration
+- PSK hint leakage
+- Weak PSK derivation (predictable IDs)
+- Forward secrecy (missing ECDHE/DHE)	Write a DTLS client that tries multiple identities
+End‑to‑end	- Nonce reuse in COSE/NACL
+- Missing context binding (HKDF fields)
+- Weak algorithms (RSA1_5, etc.)
+- Message replay without sequence number	Analyze protocol messages; replay attacks
+COSE/JOSE	- alg: none signature bypass
+- Key confusion (RS256→HS256)
+- Unprotected header manipulation
+- Algorithm downgrade	Standard JWT attacks applied to COSE tokens
+Key management	- Hardcoded keys in firmware
+- Insecure provisioning (weak enrollment)
+- Ratchet implementation flaws
+- Lack of zeroization	Firmware extraction, binary analysis, reverse engineering
+7. Summary of Critical IoT Vulnerabilities
+Vulnerability	Impact	Example
+Nonce reuse in GCM/CCM	Complete loss of confidentiality and authentication	Reusing nonce with AES-GCM can leak plaintext and allow forgery
+Missing forward secrecy	If long-term key leaks, all past sessions decrypted	PSK without ECDHE
+Weak PSK identity	Brute-force leads to unauthorized device connections	Predictable serial‑based identity
+COSE algorithm confusion	Token forgery or decryption	Accepting alg: none or using weak key wrapping
+End‑to‑end replay	Replay old commands to IoT actuator	No sequence number in encrypted payload
+Hardcoded keys in firmware	Mass device compromise	Extracted from firmware dump
+IoT security testing often requires specialized hardware and knowledge of embedded systems, but the core cryptographic weaknesses are the same as in web APIs—just with different protocols. Focus on nonce reuse, algorithm downgrades, and missing authentication; those are the highest‑impact bugs you’ll likely find.
